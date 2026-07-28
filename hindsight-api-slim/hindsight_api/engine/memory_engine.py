@@ -1222,7 +1222,7 @@ class MemoryEngine(MemoryEngineInterface):
             base_url=reflect_base_url,
             model=reflect_model,
             reasoning_effort=config.llm_reasoning_effort,
-            extra_body=config.llm_extra_body,
+            extra_body=config.reflect_llm_extra_body or config.llm_extra_body,
             default_headers=config.llm_default_headers,
             ollama_num_ctx=config.llm_ollama_num_ctx,
             litellmrouter_config=config.reflect_llm_litellmrouter_config or config.llm_litellmrouter_config,
