@@ -79,6 +79,21 @@ class FakeBankConfigConnection:
 
 
 @pytest.mark.asyncio
+async def test_identity_axes_are_canonicalized_before_persistence() -> None:
+    backend = FakeBankConfigBackend()
+    resolver = ConfigResolver(backend=backend)
+
+    await resolver.update_bank_config(
+        "bank",
+        {"consolidation_identity_axes": [{"name": " Package ", "tokens": ["Straße", " MELUSINE-WORLD-SCHOBER "]}]},
+    )
+
+    assert backend.config["consolidation_identity_axes"] == [
+        {"name": "Package", "tokens": ["strasse", "melusine-world-schober"]}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_config_key_normalization():
     """Test that env var keys are normalized to Python field names."""
     # Test basic normalization
@@ -143,9 +158,11 @@ async def test_hierarchical_fields_categorization():
     assert "consolidation_llm_parallelism" in configurable
     assert "audit_log_enabled" in configurable
     assert "store_document_text" in configurable
+    assert "inference_profile" in configurable
+    assert "consolidation_identity_axes" in configurable
 
     # Verify count is correct
-    assert len(configurable) == 42
+    assert len(configurable) == 44
 
     # Verify credential fields (NEVER exposed)
     assert "llm_api_key" in credentials

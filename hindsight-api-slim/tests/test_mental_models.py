@@ -1920,6 +1920,7 @@ class TestMentalModelRefreshMaxTokens:
 
         engine = MemoryEngine.__new__(MemoryEngine)
         engine._authenticate_tenant = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        engine._resolve_full_config = AsyncMock(return_value=None)  # type: ignore[method-assign]
         engine.get_mental_model = AsyncMock(return_value=mental_model)  # type: ignore[method-assign]
         engine.reflect_async = AsyncMock(  # type: ignore[method-assign]
             return_value=ReflectResult(text="stub synthesis", based_on={})

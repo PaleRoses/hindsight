@@ -18,20 +18,23 @@ NOTE: Observations are distinct from mental models (pinned reflections).
 import asyncio
 import json
 import logging
+import re
 import time
+import unicodedata
 import uuid
 from collections import defaultdict
 from contextlib import AsyncExitStack
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from fnmatch import fnmatchcase
-from itertools import combinations
+from functools import lru_cache
+from itertools import chain, combinations
 from typing import TYPE_CHECKING, Any, Literal
 
 import asyncpg
 from pydantic import BaseModel, field_validator
 
-from ...config import get_config
+from ...config import ConsolidationIdentityAxis, get_config
 from ...worker.stage import set_stage
 from ..db_utils import acquire_with_retry
 from ..llm_trace import (
@@ -68,6 +71,75 @@ def _norm_obs_text(text: str) -> str:
     which *does* lose information, so we match case-sensitively.
     """
     return " ".join((text or "").split()).strip()
+
+
+@dataclass(frozen=True)
+class _IdentityToken:
+    value: str
+    pattern: re.Pattern[str]
+
+
+@dataclass(frozen=True)
+class _IdentityAxis:
+    name: str
+    tokens: tuple[_IdentityToken, ...]
+
+
+@dataclass(frozen=True)
+class _IdentityConflict:
+    axis: str
+    source_tokens: tuple[str, ...]
+    target_tokens: tuple[str, ...]
+
+
+@lru_cache(maxsize=128)
+def _compile_identity_axes(axes: tuple[ConsolidationIdentityAxis, ...]) -> tuple[_IdentityAxis, ...]:
+    """Compile each validated bank vocabulary once."""
+
+    def compile_token(token: str) -> _IdentityToken:
+        body = r"\s+".join(re.escape(part) for part in token.split())
+        return _IdentityToken(value=token, pattern=re.compile(body))
+
+    return tuple(
+        _IdentityAxis(name=axis.name, tokens=tuple(compile_token(token) for token in axis.tokens)) for axis in axes
+    )
+
+
+def _identity_conflicts(
+    source_text: str,
+    target_text: str,
+    axes: tuple[_IdentityAxis, ...],
+) -> tuple[_IdentityConflict, ...]:
+    """Return known-versus-known disjoint identities; unknown identities remain permissive."""
+
+    def is_identifier_char(character: str) -> bool:
+        category = unicodedata.category(character)
+        return character == "-" or category[0] in {"L", "M", "N"} or category == "Pc"
+
+    def has_token(text: str, token: _IdentityToken) -> bool:
+        return any(
+            (match.start() == 0 or not is_identifier_char(text[match.start() - 1]))
+            and (match.end() == len(text) or not is_identifier_char(text[match.end()]))
+            for match in token.pattern.finditer(text)
+        )
+
+    def identities(text: str, axis: _IdentityAxis) -> frozenset[str]:
+        folded = unicodedata.normalize("NFKC", text).casefold()
+        return frozenset(token.value for token in axis.tokens if has_token(folded, token))
+
+    conflicts: list[_IdentityConflict] = []
+    for axis in axes:
+        source_tokens = identities(source_text, axis)
+        target_tokens = identities(target_text, axis)
+        if source_tokens and target_tokens and source_tokens.isdisjoint(target_tokens):
+            conflicts.append(
+                _IdentityConflict(
+                    axis=axis.name,
+                    source_tokens=tuple(sorted(source_tokens)),
+                    target_tokens=tuple(sorted(target_tokens)),
+                )
+            )
+    return tuple(conflicts)
 
 
 def _duplicate_create_target(
@@ -185,6 +257,8 @@ async def _dedup_adjudicate(
     anchor_emb_str: str | None,
     tags: list[str] | None,
     exclude_id: str | None,
+    identity_axes: tuple[_IdentityAxis, ...] = (),
+    identity_evidence: tuple[str, ...] = (),
 ) -> _DedupOutcome:
     """Probe one observation's embedding against in-scope observations and adjudicate a merge.
 
@@ -217,6 +291,21 @@ async def _dedup_adjudicate(
         rid = str(r.id)
         if exclude_id is not None and rid == exclude_id:
             continue  # never match the anchor observation against itself
+        conflicts = tuple(
+            conflict
+            for evidence_text in (anchor_text, *identity_evidence)
+            for conflict in _identity_conflicts(evidence_text, r.text, identity_axes)
+        )
+        if conflicts:
+            logger.warning(
+                "[CONSOLIDATION] dedup rejected identity-conflicting candidate %s: %s",
+                rid,
+                ", ".join(
+                    f"{conflict.axis}:{'/'.join(conflict.source_tokens)}!={'/'.join(conflict.target_tokens)}"
+                    for conflict in conflicts
+                ),
+            )
+            continue
         sim = r.similarity or 0.0
         if sim >= best_sim:
             best_id, best_text, best_sim = rid, r.text, sim
@@ -234,7 +323,19 @@ async def _dedup_adjudicate(
     )
     if decision.action != "merge":
         return _DedupOutcome(best_id=best_id, merged_text="", should_merge=False)
-    return _DedupOutcome(best_id=best_id, merged_text=decision.text.strip() or best_text, should_merge=True)
+    merged_text = decision.text.strip() or best_text
+    merge_conflicts = tuple(
+        conflict
+        for evidence_text in (anchor_text, best_text, *identity_evidence)
+        for conflict in _identity_conflicts(evidence_text, merged_text, identity_axes)
+    )
+    if merge_conflicts:
+        logger.warning(
+            "[CONSOLIDATION] dedup rejected identity-conflicting merged text for candidate %s",
+            best_id,
+        )
+        return _DedupOutcome(best_id=best_id, merged_text="", should_merge=False)
+    return _DedupOutcome(best_id=best_id, merged_text=merged_text, should_merge=True)
 
 
 async def _dedup_reconcile_create(
@@ -246,6 +347,8 @@ async def _dedup_reconcile_create(
     create_text: str,
     create_source_ids: list[uuid.UUID],
     tags: list[str] | None,
+    identity_axes: tuple[_IdentityAxis, ...] = (),
+    source_identity_texts: tuple[str, ...] = (),
 ) -> str | None:
     """Semantic dedup for a single CREATE (create-time, focused 1-by-1).
 
@@ -254,7 +357,17 @@ async def _dedup_reconcile_create(
     no near twin or the LLM keeps them distinct.
     """
     outcome = await _dedup_adjudicate(
-        conn, memory_engine, bank_id, config, dedup_llm_config, create_text, None, tags, exclude_id=None
+        conn,
+        memory_engine,
+        bank_id,
+        config,
+        dedup_llm_config,
+        create_text,
+        None,
+        tags,
+        exclude_id=None,
+        identity_axes=identity_axes,
+        identity_evidence=source_identity_texts,
     )
     if not outcome.should_merge or outcome.best_id is None:
         return None
@@ -293,6 +406,8 @@ async def _dedup_reconcile_update(
     updated_text: str,
     updated_emb_str: str | None,
     tags: list[str] | None,
+    identity_axes: tuple[_IdentityAxis, ...] = (),
+    identity_evidence: tuple[str, ...] = (),
 ) -> None:
     """Semantic dedup for an UPDATE (after the observation was rewritten + re-embedded).
 
@@ -314,6 +429,8 @@ async def _dedup_reconcile_update(
         updated_emb_str,
         tags,
         exclude_id=updated_id,
+        identity_axes=identity_axes,
+        identity_evidence=identity_evidence,
     )
     if not outcome.should_merge or outcome.best_id is None:
         return
@@ -543,6 +660,99 @@ class _BatchLLMResult:
     obs_count: int = 0
     prompt_chars: int = 0
     failed: bool = False
+
+
+@dataclass(frozen=True)
+class _IdentityViolation:
+    action: Literal["create", "update"]
+    observation_id: str | None
+    source_fact_id: str
+    conflicts: tuple[_IdentityConflict, ...]
+
+
+def _find_identity_violations(
+    result: _BatchLLMResult,
+    memories: list[dict[str, Any]],
+    observations: "list[MemoryFact]",
+    axes: tuple[_IdentityAxis, ...],
+) -> tuple[_IdentityViolation, ...]:
+    """Inspect source, target, and proposed texts at the model-output boundary."""
+    if not axes:
+        return ()
+
+    memories_by_id = {str(memory["id"]): memory for memory in memories}
+    observations_by_id = {str(observation.id): observation for observation in observations}
+    violations: list[_IdentityViolation] = []
+
+    def inspect_sources(
+        *,
+        action: Literal["create", "update"],
+        source_fact_ids: list[str],
+        target_text: str,
+        observation_id: str | None,
+    ) -> None:
+        for source_fact_id in dict.fromkeys(source_fact_ids):
+            source = memories_by_id.get(source_fact_id)
+            if source is None:
+                continue
+            conflicts = _identity_conflicts(str(source.get("text") or ""), target_text, axes)
+            if conflicts:
+                violations.append(
+                    _IdentityViolation(
+                        action=action,
+                        observation_id=observation_id,
+                        source_fact_id=source_fact_id,
+                        conflicts=conflicts,
+                    )
+                )
+
+    for create in result.creates:
+        inspect_sources(
+            action="create",
+            source_fact_ids=create.source_fact_ids,
+            target_text=create.text,
+            observation_id=None,
+        )
+
+    for update in result.updates:
+        target = observations_by_id.get(update.observation_id)
+        if target is None:
+            continue
+        inspect_sources(
+            action="update",
+            source_fact_ids=update.source_fact_ids,
+            target_text=target.text,
+            observation_id=update.observation_id,
+        )
+        inspect_sources(
+            action="update",
+            source_fact_ids=update.source_fact_ids,
+            target_text=update.text,
+            observation_id=update.observation_id,
+        )
+        conflicts = _identity_conflicts(update.text, target.text, axes)
+        if conflicts:
+            violations.append(
+                _IdentityViolation(
+                    action="update",
+                    observation_id=update.observation_id,
+                    source_fact_id=next(iter(update.source_fact_ids), "<update-text>"),
+                    conflicts=conflicts,
+                )
+            )
+    return tuple(violations)
+
+
+def _format_identity_violations(violations: tuple[_IdentityViolation, ...]) -> str:
+    return "; ".join(
+        f"action={violation.action} observation={violation.observation_id or '-'} "
+        f"source={violation.source_fact_id} "
+        + ", ".join(
+            f"{conflict.axis}:{'/'.join(conflict.source_tokens)}!={'/'.join(conflict.target_tokens)}"
+            for conflict in violation.conflicts
+        )
+        for violation in violations
+    )
 
 
 @dataclass
@@ -791,29 +1001,43 @@ async def run_consolidation_job(
     Returns:
         Dict with consolidation results
     """
-    # Resolve bank-specific config with hierarchical overrides
-    config = await memory_engine._config_resolver.resolve_full_config(bank_id, request_context)
+    async with memory_engine._bank_operation_scope(bank_id, request_context):
+        # Resolve once through the engine-owned operation snapshot.
+        config = await memory_engine._resolve_full_config(bank_id, request_context)
 
-    # Build a configured LLM wrapper that applies per-bank settings (e.g. safety settings)
-    # to every call without leaking across operations.
-    llm_config = memory_engine._consolidation_llm_config.with_config(config, bank_id=bank_id, operation="consolidation")
-
-    # Bind the operation trace context for the whole run so the create/update DB
-    # sites (deep inside _process_memory_batch) can accumulate the observations
-    # this consolidation produced and the source memories it consumed onto the
-    # trace — flushed onto every trace row on exit by attach_memory_ids.
-    trace_ctx = trace_context_of(llm_config)
-    trace_token = set_trace_context(trace_ctx) if trace_ctx is not None else None
-    try:
-        return await _run_consolidation_job(
-            memory_engine, bank_id, request_context, config, llm_config, operation_id, observation_scopes
+        # Build a configured LLM wrapper that applies per-bank settings (e.g. safety settings)
+        # to every call without leaking across operations.
+        llm_config = memory_engine._consolidation_llm_config.with_config(
+            config,
+            bank_id=bank_id,
+            operation="consolidation",
         )
-    finally:
-        if trace_token is not None:
-            reset_trace_context(trace_token)
-            # Fire-and-forget: patched on a background task, off the consolidation
-            # critical path.
-            memory_engine._llm_recorder.attach_memory_ids(trace_ctx)
+        if llm_config.provider == "none":
+            logger.debug(f"Consolidation disabled for bank {bank_id}: selected route is 'none'")
+            return {"status": "disabled", "bank_id": bank_id}
+
+        # Bind the operation trace context for the whole run so the create/update DB
+        # sites (deep inside _process_memory_batch) can accumulate the observations
+        # this consolidation produced and the source memories it consumed onto the
+        # trace — flushed onto every trace row on exit by attach_memory_ids.
+        trace_ctx = trace_context_of(llm_config)
+        trace_token = set_trace_context(trace_ctx) if trace_ctx is not None else None
+        try:
+            return await _run_consolidation_job(
+                memory_engine,
+                bank_id,
+                request_context,
+                config,
+                llm_config,
+                operation_id,
+                observation_scopes,
+            )
+        finally:
+            if trace_token is not None:
+                reset_trace_context(trace_token)
+                # Fire-and-forget: patched on a background task, off the consolidation
+                # critical path.
+                memory_engine._llm_recorder.attach_memory_ids(trace_ctx)
 
 
 async def _run_consolidation_job(
@@ -1490,6 +1714,7 @@ async def _trigger_mental_model_refreshes(
                 request_context=request_context,
             )
             refreshed_count += 1
+
             logger.info(
                 f"[CONSOLIDATION] Triggered refresh for mental model {mental_model_id} "
                 f"(name: {row['name']}) in bank {bank_id}"
@@ -1596,9 +1821,10 @@ async def _process_memory_batch(
                 f"({current_count}/{max_obs}), only updates/deletes allowed"
             )
 
-    # 3. Single LLM call
+    # 3. Single guarded LLM call
+    identity_axes = _compile_identity_axes(tuple(getattr(config, "consolidation_identity_axes", ())))
     t0 = time.time()
-    llm_result = await _consolidate_batch_with_llm(
+    llm_result = await _consolidate_batch_with_identity_guard(
         llm_config=llm_config,
         memories=memories,
         union_observations=union_observations,
@@ -1606,10 +1832,11 @@ async def _process_memory_batch(
         config=config,
         remaining_observation_slots=remaining_observation_slots,
         max_observations_per_scope=max_obs,
+        identity_axes=identity_axes,
+        perf=perf,
     )
     if perf:
         perf.record_timing("llm", time.time() - t0)
-        perf.record_llm_call(llm_result.obs_count, llm_result.prompt_chars)
 
     # 4. Sequential execution of deletes / updates / creates
     # Deletes run first to free observation slots before creates consume them.
@@ -1687,6 +1914,8 @@ async def _process_memory_batch(
                 update.text,
                 updated_emb_str,
                 agg.tags,
+                identity_axes=identity_axes,
+                identity_evidence=tuple(str(memory.get("text") or "") for memory in source_mems),
             )
 
     # Deterministic dedup guard: map the observations the LLM was SHOWN by their
@@ -1726,7 +1955,16 @@ async def _process_memory_batch(
         # near-identical observation (LLM-adjudicated, 1-by-1) instead of inserting a dup.
         if dedup_enabled:
             merged_into = await _dedup_reconcile_create(
-                conn, memory_engine, bank_id, config, dedup_llm_config, create.text, create_source_ids, agg.tags
+                conn,
+                memory_engine,
+                bank_id,
+                config,
+                dedup_llm_config,
+                create.text,
+                create_source_ids,
+                agg.tags,
+                identity_axes=identity_axes,
+                source_identity_texts=tuple(str(memory.get("text") or "") for memory in source_mems),
             )
             if merged_into is not None:
                 logger.info(
@@ -2080,7 +2318,7 @@ async def _find_related_observations(
     # max_tokens naturally limits how many observations are returned
     from ...tracing import get_tracer, is_tracing_enabled
 
-    config = await memory_engine._config_resolver.resolve_full_config(bank_id, request_context)
+    config = await memory_engine._resolve_full_config(bank_id, request_context)
 
     # SECURITY: Use all_strict matching if tags provided to prevent cross-scope consolidation
     tags_match = "all_strict" if tags else "any"
@@ -2212,6 +2450,7 @@ async def _consolidate_batch_with_llm(
     config: Any,
     remaining_observation_slots: int | None = None,
     max_observations_per_scope: int = -1,
+    max_attempts_override: int | None = None,
 ) -> _BatchLLMResult:
     """Single LLM call for a batch of facts against a pooled set of observations."""
     if config is None:
@@ -2290,7 +2529,7 @@ async def _consolidate_batch_with_llm(
         supports_max_items=config.llm_supports_max_items,
     )
 
-    max_attempts = config.consolidation_max_attempts
+    max_attempts = max_attempts_override or config.consolidation_max_attempts
     inner_max_retries = config.consolidation_llm_max_retries
     last_exc: Exception | None = None
     # Pre-compute a stable identifier set for the batch so failure logs name the
@@ -2359,6 +2598,113 @@ async def _consolidate_batch_with_llm(
     return _BatchLLMResult(
         obs_count=len(union_observations), prompt_chars=len(system_prompt) + len(user_content), failed=True
     )
+
+
+async def _consolidate_batch_with_identity_guard(
+    *,
+    llm_config: Any,
+    memories: list[dict[str, Any]],
+    union_observations: "list[MemoryFact]",
+    union_source_facts: "dict[str, MemoryFact]",
+    config: Any,
+    remaining_observation_slots: int | None,
+    max_observations_per_scope: int,
+    identity_axes: tuple[_IdentityAxis, ...],
+    perf: ConsolidationPerfLog | None,
+) -> _BatchLLMResult:
+    """Retry model output without identity-conflicting targets, then fail closed."""
+    available_observations = list(union_observations)
+    rejected_observation_ids: set[str] = set()
+    displaced_source_ids: set[str] = set()
+    memory_ids = {str(memory["id"]) for memory in memories}
+    max_attempts = max(1, config.consolidation_max_attempts)
+    for attempt in range(1, max_attempts + 1):
+        result = await _consolidate_batch_with_llm(
+            llm_config=llm_config,
+            memories=memories,
+            union_observations=available_observations,
+            union_source_facts=union_source_facts,
+            config=config,
+            remaining_observation_slots=remaining_observation_slots,
+            max_observations_per_scope=max_observations_per_scope,
+            max_attempts_override=1,
+        )
+        if perf:
+            perf.record_llm_call(result.obs_count, result.prompt_chars)
+        if result.failed:
+            if attempt == max_attempts:
+                return result
+            continue
+
+        violations = _find_identity_violations(
+            result,
+            memories,
+            union_observations,
+            identity_axes,
+        )
+        accounted_source_ids = {
+            source_id for action in chain(result.creates, result.updates) for source_id in action.source_fact_ids
+        }
+        unaccounted_source_ids = displaced_source_ids - accounted_source_ids
+        referenced_rejected_ids = rejected_observation_ids.intersection(
+            {action.observation_id for action in chain(result.updates, result.deletes)}
+        )
+        if not violations and not unaccounted_source_ids and not referenced_rejected_ids:
+            return result
+
+        if violations:
+            logger.warning(
+                "[CONSOLIDATION] rejected identity-conflicting model output (attempt %d/%d): %s",
+                attempt,
+                max_attempts,
+                _format_identity_violations(violations),
+            )
+            newly_rejected_ids = {
+                violation.observation_id for violation in violations if violation.observation_id is not None
+            }
+            rejected_observation_ids.update(newly_rejected_ids)
+            violating_update_ids = {
+                violation.observation_id for violation in violations if violation.action == "update"
+            }
+            displaced_source_ids.update(
+                source_id
+                for update in result.updates
+                if update.observation_id in violating_update_ids
+                for source_id in update.source_fact_ids
+                if source_id in memory_ids
+            )
+            displaced_source_ids.update(
+                violation.source_fact_id
+                for violation in violations
+                if violation.action == "create" and violation.source_fact_id in memory_ids
+            )
+            available_observations = [
+                observation
+                for observation in available_observations
+                if str(observation.id) not in rejected_observation_ids
+            ]
+        else:
+            logger.warning(
+                "[CONSOLIDATION] retry did not preserve identity-guard constraints "
+                "(attempt %d/%d): missing_sources=%s rejected_targets=%s",
+                attempt,
+                max_attempts,
+                sorted(unaccounted_source_ids),
+                sorted(referenced_rejected_ids),
+            )
+
+        if attempt == max_attempts:
+            logger.error(
+                "[CONSOLIDATION] identity guard exhausted after %d attempts; failing batch",
+                max_attempts,
+            )
+            return _BatchLLMResult(
+                obs_count=result.obs_count,
+                prompt_chars=result.prompt_chars,
+                failed=True,
+            )
+
+    return _BatchLLMResult(failed=True)
 
 
 async def _create_observation_directly(

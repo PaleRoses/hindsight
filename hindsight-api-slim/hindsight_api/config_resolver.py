@@ -9,9 +9,11 @@ multiple API servers.
 """
 
 import asyncio
+import copy
 import json
 import logging
-from dataclasses import asdict, replace
+from collections.abc import Mapping
+from dataclasses import fields, replace
 from typing import TYPE_CHECKING, Any
 
 from hindsight_api.config import (
@@ -19,10 +21,12 @@ from hindsight_api.config import (
     HindsightConfig,
     _get_raw_config,
     normalize_config_dict,
+    parse_consolidation_identity_axes,
+    validate_inference_profile_selector,
     validate_retain_chunking_config,
     validate_retain_completion_token_budget,
 )
-from hindsight_api.engine.memory_engine import fq_table
+from hindsight_api.engine.schema import fq_table
 from hindsight_api.extensions.tenant import TenantExtension
 from hindsight_api.models import RequestContext
 
@@ -30,6 +34,25 @@ if TYPE_CHECKING:
     from hindsight_api.engine.db.base import DatabaseBackend
 
 logger = logging.getLogger(__name__)
+
+
+def _config_field_values(config: HindsightConfig) -> dict[str, Any]:
+    """Project dataclass fields without recursively copying static credentials."""
+    return {field.name: getattr(config, field.name) for field in fields(config)}
+
+
+def _safe_config_field_values(
+    config: HindsightConfig | Mapping[str, Any],
+    configurable_fields: set[str],
+    credential_fields: set[str],
+) -> dict[str, Any]:
+    """Copy only API-safe configurable fields."""
+    values = _config_field_values(config) if isinstance(config, HindsightConfig) else config
+    return {
+        key: copy.deepcopy(value)
+        for key, value in values.items()
+        if key in configurable_fields and key not in credential_fields
+    }
 
 
 def _validate_retain_strategy_chunking(base_config: HindsightConfig, strategies: Any) -> None:
@@ -80,22 +103,22 @@ class ConfigResolver:
 
     async def _resolve_parent_config_dict(self, bank_id: str, context: RequestContext | None = None) -> dict[str, Any]:
         """Resolve global + tenant config before bank-level overrides."""
-        config_dict = asdict(self._global_config)
+        config_dict = _config_field_values(self._global_config)
 
         if self.tenant_extension and context:
-            try:
-                tenant_overrides = await self.tenant_extension.get_tenant_config(context)
-                if tenant_overrides:
-                    # Normalize keys and filter to configurable fields only
-                    normalized_tenant = normalize_config_dict(tenant_overrides)
-                    configurable_tenant = {k: v for k, v in normalized_tenant.items() if k in self._configurable_fields}
-                    config_dict.update(configurable_tenant)
-                    logger.debug(
-                        f"Applied tenant config overrides for bank {bank_id}: {list(configurable_tenant.keys())}"
-                    )
-            except Exception as e:
-                logger.warning(f"Failed to load tenant config for bank {bank_id}: {e}")
+            tenant_overrides = await self.tenant_extension.get_tenant_config(context)
+            if tenant_overrides:
+                # Normalize keys and filter to configurable fields only
+                normalized_tenant = normalize_config_dict(tenant_overrides)
+                configurable_tenant = {k: v for k, v in normalized_tenant.items() if k in self._configurable_fields}
+                config_dict.update(configurable_tenant)
+                logger.debug(f"Applied tenant config overrides for bank {bank_id}: {list(configurable_tenant.keys())}")
 
+        validate_inference_profile_selector(
+            config_dict.get("inference_profile"),
+            self._global_config.inference_profiles,
+            source="tenant inference_profile",
+        )
         return config_dict
 
     async def resolve_full_config(self, bank_id: str, context: RequestContext | None = None) -> HindsightConfig:
@@ -124,24 +147,18 @@ class ConfigResolver:
         if bank_overrides:
             config_dict.update(bank_overrides)
             logger.debug(f"Applied bank config overrides for bank {bank_id}: {list(bank_overrides.keys())}")
+        validate_inference_profile_selector(
+            config_dict.get("inference_profile"),
+            self._global_config.inference_profiles,
+            source=f"bank {bank_id!r} inference_profile",
+        )
 
-        # Return full config object (dataclass doesn't have __init__ that accepts kwargs, so we update the object)
-        # Create a new config instance by copying the global config and updating fields
+        # Reconstruct from the shallow projection so static frozen payloads keep
+        # their canonical types and identities.
         resolved_config = HindsightConfig(**config_dict)
-        # Multi-LLM chains are static credential fields (never tenant/bank-overridable),
-        # but asdict() above flattened their member dataclasses into plain dicts. Restore
-        # the original typed objects from the global config so the resolved object stays
-        # well-typed for any consumer that reads them.
         resolved_config = replace(
             resolved_config,
-            llm_members=self._global_config.llm_members,
-            llm_strategy=self._global_config.llm_strategy,
-            retain_llm_members=self._global_config.retain_llm_members,
-            retain_llm_strategy=self._global_config.retain_llm_strategy,
-            reflect_llm_members=self._global_config.reflect_llm_members,
-            reflect_llm_strategy=self._global_config.reflect_llm_strategy,
-            consolidation_llm_members=self._global_config.consolidation_llm_members,
-            consolidation_llm_strategy=self._global_config.consolidation_llm_strategy,
+            consolidation_identity_axes=parse_consolidation_identity_axes(resolved_config.consolidation_identity_axes),
         )
         validate_retain_chunking_config(
             resolved_config.retain_chunk_size,
@@ -173,45 +190,33 @@ class ConfigResolver:
         Returns:
             Dict of allowed configurable fields only (never includes credentials or static fields)
         """
-        # Resolve full config with all hierarchical overrides
+        # Resolve full config, then copy only the safe projection before permissions.
         resolved_config = await self.resolve_full_config(bank_id, context)
-        config_dict = asdict(resolved_config)
-
-        # SECURITY: drop static/infrastructure + credential fields, then permission-filter.
-        filtered = self._strip_static_and_credential_fields(config_dict)
+        filtered = _safe_config_field_values(
+            resolved_config,
+            self._configurable_fields,
+            self._credential_fields,
+        )
         return await self._apply_permission_filter(filtered, bank_id, context)
-
-    def _strip_static_and_credential_fields(self, config_dict: dict[str, Any]) -> dict[str, Any]:
-        """Keep only configurable, non-credential fields.
-
-        SECURITY: excludes static/infrastructure fields and ALL credential fields
-        (API keys, base URLs, etc.) so a resolved config is safe to return over the API.
-        """
-        return {
-            k: v for k, v in config_dict.items() if k in self._configurable_fields and k not in self._credential_fields
-        }
 
     async def _apply_permission_filter(
         self, filtered: dict[str, Any], bank_id: str, context: RequestContext | None
     ) -> dict[str, Any]:
         """Further restrict already-stripped config to the tenant/bank permission allow-list.
 
-        On extension error, leaves ``filtered`` unchanged (parity with the historical
-        single-bank path: a permissions lookup failure must not leak or drop fields).
+        Extension errors propagate so permission lookup fails closed.
         """
         if not (self.tenant_extension and context):
             return filtered
-        try:
-            allowed_fields = await self.tenant_extension.get_allowed_config_fields(context, bank_id)
-            if allowed_fields is not None:  # None means "allow all"
-                filtered = {k: v for k, v in filtered.items() if k in allowed_fields}
-                logger.debug(
-                    f"Applied permission filter for bank {bank_id}: allowed={len(allowed_fields)} fields, "
-                    f"returned={len(filtered)} fields"
-                )
-        except Exception as e:
-            logger.warning(f"Failed to load permissions for bank {bank_id}: {e}")
-        return filtered
+        allowed_fields = await self.tenant_extension.get_allowed_config_fields(context, bank_id)
+        if allowed_fields is None:  # None means "allow all"
+            return filtered
+        permission_filtered = {k: v for k, v in filtered.items() if k in allowed_fields}
+        logger.debug(
+            f"Applied permission filter for bank {bank_id}: allowed={len(allowed_fields)} fields, "
+            f"returned={len(permission_filtered)} fields"
+        )
+        return permission_filtered
 
     async def get_bank_configs(
         self, bank_ids: list[str], context: RequestContext | None = None
@@ -230,22 +235,38 @@ class ConfigResolver:
             return {}
 
         # Global + tenant base, resolved once (tenant override is per-request, not per-bank).
-        base_dict = asdict(self._global_config)
+        base_dict = _safe_config_field_values(
+            self._global_config,
+            self._configurable_fields,
+            self._credential_fields,
+        )
         if self.tenant_extension and context:
-            try:
-                tenant_overrides = await self.tenant_extension.get_tenant_config(context)
-                if tenant_overrides:
-                    normalized_tenant = normalize_config_dict(tenant_overrides)
-                    base_dict.update({k: v for k, v in normalized_tenant.items() if k in self._configurable_fields})
-            except Exception as e:
-                logger.warning(f"Failed to load tenant config for bulk resolve: {e}")
+            tenant_overrides = await self.tenant_extension.get_tenant_config(context)
+            if tenant_overrides:
+                normalized_tenant = normalize_config_dict(tenant_overrides)
+                base_dict.update(
+                    {
+                        k: v
+                        for k, v in normalized_tenant.items()
+                        if k in self._configurable_fields and k not in self._credential_fields
+                    }
+                )
 
         # All bank overrides in one query, then merge + strip per bank.
         bank_overrides = await self._load_bank_configs(bank_ids)
-        stripped = {
-            bank_id: self._strip_static_and_credential_fields({**base_dict, **bank_overrides.get(bank_id, {})})
-            for bank_id in bank_ids
-        }
+        stripped: dict[str, dict[str, Any]] = {}
+        for bank_id in bank_ids:
+            merged = {**base_dict, **bank_overrides.get(bank_id, {})}
+            validate_inference_profile_selector(
+                merged.get("inference_profile"),
+                self._global_config.inference_profiles,
+                source=f"bank {bank_id!r} inference_profile",
+            )
+            stripped[bank_id] = _safe_config_field_values(
+                merged,
+                self._configurable_fields,
+                self._credential_fields,
+            )
 
         # Permission filter is per-bank; resolve concurrently when an extension is present.
         if not (self.tenant_extension and context):
@@ -265,30 +286,27 @@ class ConfigResolver:
         Returns:
             Dict of config overrides (only configurable fields, normalized keys)
         """
-        try:
-            async with self._backend.acquire() as conn:
-                row = await conn.fetchrow(
-                    f"""
-                    SELECT config FROM {fq_table("banks")} WHERE bank_id = $1
-                    """,
-                    bank_id,
-                )
+        async with self._backend.acquire() as conn:
+            row = await conn.fetchrow(
+                f"""
+                SELECT config FROM {fq_table("banks")} WHERE bank_id = $1
+                """,
+                bank_id,
+            )
 
-                if row and row["config"]:
-                    config_data = row["config"]
+            if row and row["config"]:
+                config_data = row["config"]
 
-                    # Handle case where JSONB is returned as JSON string
-                    if isinstance(config_data, str):
-                        config_data = json.loads(config_data)
+                # Handle case where JSONB is returned as JSON string
+                if isinstance(config_data, str):
+                    config_data = json.loads(config_data)
 
-                    # Normalize keys (handle both env var format and Python field format)
-                    normalized = normalize_config_dict(config_data)
+                # Normalize keys (handle both env var format and Python field format)
+                normalized = normalize_config_dict(config_data)
 
-                    # Only return active overrides for configurable fields. JSON null is a tombstone
-                    # for "Server Default" in the bank-config UI and should not override defaults.
-                    return {k: v for k, v in normalized.items() if k in self._configurable_fields and v is not None}
-        except Exception as e:
-            logger.error(f"Failed to load bank config for {bank_id}: {e}")
+                # Only return active overrides for configurable fields. JSON null is a tombstone
+                # for "Server Default" in the bank-config UI and should not override defaults.
+                return {k: v for k, v in normalized.items() if k in self._configurable_fields and v is not None}
 
         return {}
 
@@ -301,34 +319,29 @@ class ConfigResolver:
         result: dict[str, dict[str, Any]] = {}
         if not bank_ids:
             return result
-        try:
-            async with self._backend.acquire() as conn:
-                rows = await conn.fetch(
-                    f"""
-                    SELECT bank_id, config FROM {fq_table("banks")} WHERE bank_id = ANY($1)
-                    """,
-                    bank_ids,
-                )
-                for row in rows:
-                    config_data = row["config"]
-                    if not config_data:
-                        continue
-                    # Handle case where JSONB is returned as JSON string
-                    if isinstance(config_data, str):
-                        config_data = json.loads(config_data)
+        async with self._backend.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT bank_id, config FROM {fq_table("banks")} WHERE bank_id = ANY($1)
+                """,
+                bank_ids,
+            )
+            for row in rows:
+                config_data = row["config"]
+                if not config_data:
+                    continue
+                # Handle case where JSONB is returned as JSON string
+                if isinstance(config_data, str):
+                    config_data = json.loads(config_data)
 
-                    # Normalize keys (handle both env var format and Python field format)
-                    normalized = normalize_config_dict(config_data)
+                # Normalize keys (handle both env var format and Python field format)
+                normalized = normalize_config_dict(config_data)
 
-                    # Only active overrides for configurable fields. JSON null is a tombstone
-                    # for "Server Default" in the bank-config UI and must not override defaults.
-                    overrides = {
-                        k: v for k, v in normalized.items() if k in self._configurable_fields and v is not None
-                    }
-                    if overrides:
-                        result[row["bank_id"]] = overrides
-        except Exception as e:
-            logger.error(f"Failed to bulk-load bank configs: {e}")
+                # Only active overrides for configurable fields. JSON null is a tombstone
+                # for "Server Default" in the bank-config UI and must not override defaults.
+                overrides = {k: v for k, v in normalized.items() if k in self._configurable_fields and v is not None}
+                if overrides:
+                    result[row["bank_id"]] = overrides
         return result
 
     async def validate_bank_config_updates(
@@ -409,6 +422,12 @@ class ConfigResolver:
             except Exception as e:
                 logger.warning(f"Failed to check permissions for bank {bank_id}: {e}")
                 # Continue without permission check (fail open for backward compatibility)
+        if "inference_profile" in normalized_updates and normalized_updates["inference_profile"] is not None:
+            validate_inference_profile_selector(
+                normalized_updates["inference_profile"],
+                self._global_config.inference_profiles,
+                source=f"bank {bank_id!r} inference_profile",
+            )
 
         # Validate entity_labels structure
         if "entity_labels" in normalized_updates and normalized_updates["entity_labels"] is not None:
@@ -418,6 +437,17 @@ class ConfigResolver:
                 parse_entity_labels(normalized_updates["entity_labels"])
             except Exception as e:
                 raise ValueError(f"Invalid entity_labels format: {e}")
+        if (
+            "consolidation_identity_axes" in normalized_updates
+            and normalized_updates["consolidation_identity_axes"] is not None
+        ):
+            try:
+                axes = parse_consolidation_identity_axes(normalized_updates["consolidation_identity_axes"])
+            except ValueError as e:
+                raise ValueError(f"Invalid consolidation_identity_axes format: {e}") from e
+            normalized_updates["consolidation_identity_axes"] = [
+                {"name": axis.name, "tokens": list(axis.tokens)} for axis in axes
+            ]
 
         # Validate retain_strategies: reject empty string keys
         if "retain_strategies" in normalized_updates and normalized_updates["retain_strategies"]:

@@ -87,7 +87,7 @@ class AnthropicLLM(LLMInterface):
         base_url: str,
         model: str,
         reasoning_effort: str = "low",
-        timeout: float = 300.0,
+        timeout: float | None = None,
         default_headers: dict[str, str] | None = None,
         extra_body: dict[str, Any] | None = None,
         **kwargs: Any,
@@ -141,15 +141,17 @@ class AnthropicLLM(LLMInterface):
             # SDK retries disabled — wrapper-level retry loop in ``call`` handles
             # backoff (mirrors ``OpenAICompatibleLLM`` so the two providers behave
             # consistently).
-            client_kwargs: dict[str, Any] = {"api_key": self.api_key, "max_retries": 0}
+            client_kwargs: dict[str, Any] = {
+                "api_key": self.api_key,
+                "max_retries": 0,
+                "timeout": 300.0 if timeout is None else timeout,
+            }
             if self.base_url:
                 client_kwargs["base_url"] = self.base_url
                 # Operators pointing at a proxy (e.g. omp's auth-gateway) hold a
                 # bearer token, not an Anthropic key. `auth_token` makes the SDK
                 # send it as `Authorization: Bearer` alongside `x-api-key`.
                 client_kwargs["auth_token"] = self.api_key
-            if timeout:
-                client_kwargs["timeout"] = timeout
             if default_headers:
                 client_kwargs["default_headers"] = default_headers
 

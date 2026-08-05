@@ -85,6 +85,7 @@ def _obs(text: str, sim: float, oid: str = _TWIN_ID) -> RetrievalResult:
 def _ctx(threshold: float = 0.97):
     """Return (kwargs, conn_mock, llm_mock) for a _dedup_reconcile_create call."""
     conn = AsyncMock()
+    conn.execute.return_value = "UPDATE 1"
     llm = types.SimpleNamespace(call=AsyncMock())
     kwargs = dict(
         conn=conn,
@@ -267,6 +268,7 @@ _UPDATED_ID = "44444444-4444-4444-8444-444444444444"
 def _update_ctx(threshold: float = 0.97):
     """Return (kwargs, conn_mock, llm_mock) for a _dedup_reconcile_update call."""
     conn = AsyncMock()
+    conn.execute.return_value = "UPDATE 1"
     llm = types.SimpleNamespace(call=AsyncMock())
     kwargs = dict(
         conn=conn,
@@ -290,6 +292,7 @@ def _update_ctx(threshold: float = 0.97):
 
 async def test_dedup_update_merge_folds_into_twin_and_deletes_updated() -> None:
     kwargs, conn, llm = _update_ctx()
+    conn.execute.side_effect = ["UPDATE 1", "DELETE 1"]
     llm.call.return_value = _DedupDecision(action="merge", text="Uzbek YouTube content is very rich and growing.")
     with _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.98)]):
         await _dedup_reconcile_update(**kwargs)

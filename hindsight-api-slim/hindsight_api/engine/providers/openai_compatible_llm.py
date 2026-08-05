@@ -48,6 +48,7 @@ from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usag
 from hindsight_api.engine.providers.llm_debug import dump_request_on_4xx
 from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
 from hindsight_api.engine.structured_output import strict_json_schema
+from hindsight_api.llm_provider_metadata import OPENAI_COMPATIBLE_PROVIDERS, get_llm_provider_metadata
 from hindsight_api.metrics import get_metrics_collector
 from hindsight_api.worker.stage import set_stage
 
@@ -529,6 +530,7 @@ class OpenAICompatibleLLM(LLMInterface):
         timeout: float | None = None,
         groq_service_tier: str | None = None,
         extra_body: dict[str, Any] | None = None,
+        default_headers: dict[str, str] | None = None,
         *,
         ollama_num_ctx: int | None = None,
         **kwargs: Any,
@@ -545,88 +547,37 @@ class OpenAICompatibleLLM(LLMInterface):
             timeout: Request timeout in seconds (uses env var or 120s default).
             groq_service_tier: Groq service tier ("on_demand", "flex", "auto").
             extra_body: Extra body params merged into every API call.
+            default_headers: Headers supplied to every request by the OpenAI SDK client.
             ollama_num_ctx: Native Ollama context window override. None lets Ollama use
                 the model/server default.
             **kwargs: Additional provider-specific parameters.
         """
         super().__init__(provider, api_key, base_url, model, reasoning_effort, **kwargs)
 
-        # Validate provider
-        valid_providers = [
-            "openai",
-            "groq",
-            "ollama",
-            "ollama-cloud",
-            "lmstudio",
-            "llamacpp",
-            "minimax",
-            "deepseek",
-            "volcano",
-            "openrouter",
-            "requesty",
-            "zai",
-            "opencode-go",
-            "atlas",
-            "fireworks",
-        ]
-        if self.provider not in valid_providers:
-            raise ValueError(f"OpenAICompatibleLLM only supports: {', '.join(valid_providers)}. Got: {self.provider}")
+        try:
+            metadata = get_llm_provider_metadata(self.provider)
+        except ValueError:
+            raise ValueError(
+                f"OpenAICompatibleLLM only supports: {', '.join(OPENAI_COMPATIBLE_PROVIDERS)}. Got: {self.provider}"
+            ) from None
+        if not metadata.openai_compatible:
+            raise ValueError(
+                f"OpenAICompatibleLLM only supports: {', '.join(OPENAI_COMPATIBLE_PROVIDERS)}. Got: {self.provider}"
+            )
 
-        # Set default base URLs
-        if not self.base_url:
-            if self.provider == "groq":
-                self.base_url = "https://api.groq.com/openai/v1"
-            elif self.provider == "ollama":
-                self.base_url = "http://localhost:11434/v1"
-            elif self.provider == "ollama-cloud":
-                self.base_url = "https://ollama.com/v1"
-            elif self.provider == "lmstudio":
-                self.base_url = "http://localhost:1234/v1"
-            elif self.provider == "minimax":
-                self.base_url = "https://api.minimax.io/v1"
-            elif self.provider == "deepseek":
-                self.base_url = "https://api.deepseek.com"
-            elif self.provider == "openrouter":
-                self.base_url = "https://openrouter.ai/api/v1"
-            elif self.provider == "requesty":
-                self.base_url = "https://router.requesty.ai/v1"
-            elif self.provider == "zai":
-                self.base_url = "https://api.z.ai/api/coding/paas/v4"
-            elif self.provider == "opencode-go":
-                self.base_url = "https://opencode.ai/zen/go/v1"
-            elif self.provider == "atlas":
-                self.base_url = "https://api.atlascloud.ai/v1"
-            elif self.provider == "fireworks":
-                # OpenAI-compatible inference host (online path). The batch API
-                # lives on a separate control-plane host — see FireworksLLM.
-                self.base_url = "https://api.fireworks.ai/inference/v1"
+        self.base_url = self.base_url or metadata.default_base_url
 
         # Normalize bare local base URLs (e.g. a user pasting the address shown
         # in the LM Studio UI) so the OpenAI SDK targets the `/v1` routes. See #2922.
         if self.provider in _V1_PATH_LOCAL_PROVIDERS and self.base_url:
             self.base_url = _ensure_v1_base_url(self.base_url)
 
-        # For ollama/lmstudio, use dummy key if not provided
-        if self.provider in ("ollama", "lmstudio") and not self.api_key:
+        # The OpenAI SDK requires a non-empty placeholder even for local providers.
+        if not metadata.requires_api_key and not self.api_key:
             self.api_key = "local"
 
-        # Validate API key for cloud providers
-        if (
-            self.provider
-            in (
-                "openai",
-                "groq",
-                "minimax",
-                "deepseek",
-                "openrouter",
-                "requesty",
-                "zai",
-                "opencode-go",
-                "atlas",
-                "ollama-cloud",
-            )
-            and not self.api_key
-        ):
+        # Validate API keys from the same provider policy as every other constructor.
+        if metadata.requires_api_key and not self.api_key:
             raise ValueError(f"API key is required for {self.provider}")
 
         # Service tier configuration (from config, not env vars)
@@ -651,6 +602,8 @@ class OpenAICompatibleLLM(LLMInterface):
                 self.base_url = clean_url
             else:
                 client_kwargs["base_url"] = self.base_url
+        if default_headers:
+            client_kwargs["default_headers"] = default_headers
         if self.timeout:
             client_kwargs["timeout"] = self.timeout
 
@@ -849,6 +802,8 @@ class OpenAICompatibleLLM(LLMInterface):
             # Add reasoning parameters for reasoning models
             if is_reasoning_model:
                 extra_body["include_reasoning"] = False
+        if self.provider == "openai" and self.openai_service_tier:
+            call_params["service_tier"] = self.openai_service_tier
         if extra_body:
             call_params["extra_body"] = extra_body
 
@@ -1261,6 +1216,10 @@ class OpenAICompatibleLLM(LLMInterface):
         self._apply_provider_extra_body_defaults(extra_body)
         if self.provider == "groq":
             call_params["seed"] = DEFAULT_LLM_SEED
+            if self.groq_service_tier:
+                extra_body["service_tier"] = self.groq_service_tier
+        if self.provider == "openai" and self.openai_service_tier:
+            call_params["service_tier"] = self.openai_service_tier
         if extra_body:
             call_params["extra_body"] = extra_body
 

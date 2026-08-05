@@ -30,6 +30,7 @@ from .config import (
     ENV_ACCESS_LOG,
     ENV_HOST,
     ENV_WORKERS,
+    INFERENCE_PROFILE_OPERATIONS,
     HindsightConfig,
     _get_raw_config,
     load_dotenv_for_entrypoint,
@@ -52,6 +53,19 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Global reference for cleanup
 _memory: MemoryEngine | None = None
+
+
+def _startup_llm_identity(config: HindsightConfig) -> tuple[str, str]:
+    """Return a truthful banner identity for the active startup routing mode."""
+    if config.inference_profile is None:
+        return config.llm_provider, config.llm_model
+
+    profile = config.inference_profiles[config.inference_profile]
+    routes = ", ".join(
+        f"{operation}={profile.route(operation).provider}/{profile.route(operation).model}"
+        for operation in INFERENCE_PROFILE_OPERATIONS
+    )
+    return f"profile={config.inference_profile}", routes
 
 
 def _cleanup():
@@ -344,12 +358,14 @@ def main():
     if not is_daemon:
         from .banner import print_startup_info
 
+        startup_llm_provider, startup_llm_model = _startup_llm_identity(config)
+
         print_startup_info(
             host=args.host,
             port=args.port,
             database_url=config.database_url,
-            llm_provider=config.llm_provider,
-            llm_model=config.llm_model,
+            llm_provider=startup_llm_provider,
+            llm_model=startup_llm_model,
             embeddings_provider=config.embeddings_provider,
             reranker_provider=config.reranker_provider,
             mcp_enabled=config.mcp_enabled,
