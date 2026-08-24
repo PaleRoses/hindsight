@@ -11,7 +11,6 @@ from hindsight_api.config import (
     DEFAULT_LLM_MAX_RETRIES,
     DEFAULT_LLM_MODEL,
     DEFAULT_LLM_PROVIDER,
-    DEFAULT_LLM_REASONING_EFFORT,
     DEFAULT_LLM_TIMEOUT,
     PROVIDER_DEFAULT_MODELS,
     HindsightConfig,
@@ -469,7 +468,7 @@ def test_selected_profile_ignores_invalid_legacy_route_environment(tmp_path, mon
     for operation in OPERATIONS:
         route = memory._inference_llm(operation)
         assert route.default_headers is None
-        assert route.reasoning_effort == DEFAULT_LLM_REASONING_EFFORT
+        assert route.reasoning_effort is None
         assert route.timeout == DEFAULT_LLM_TIMEOUT
         assert route.max_retries == DEFAULT_LLM_MAX_RETRIES
 
@@ -1037,6 +1036,7 @@ async def test_direct_consolidation_job_scopes_the_bank_profile_once(tmp_path, m
         llm_config,
         _operation_id,
         _observation_scopes,
+        _pending_refresh_tags,
     ):
         captured["bank_id"] = bank_id
         captured["profile"] = config.inference_profile
@@ -1082,6 +1082,7 @@ async def test_bank_selected_consolidation_route_controls_direct_and_worker_exec
         llm_config,
         _operation_id,
         _observation_scopes,
+        _pending_refresh_tags,
     ):
         calls.append((bank_id, llm_config.model))
         assert config.enable_observations is True

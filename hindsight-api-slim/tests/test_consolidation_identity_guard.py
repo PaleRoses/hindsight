@@ -20,6 +20,7 @@ from hindsight_api.engine.consolidation.consolidator import (
     _find_identity_violations,
     _identity_conflicts,
     _IdentityAxis,
+    _TemporalBounds,
     _UpdateAction,
 )
 from hindsight_api.engine.response_models import MemoryFact
@@ -236,11 +237,13 @@ async def test_dedup_skips_incompatible_best_candidate_before_llm() -> None:
     llm = types.SimpleNamespace(call=AsyncMock())
 
     with patch(
-        "hindsight_api.engine.search.retrieval.retrieve_semantic_bm25_combined",
-        AsyncMock(return_value={"observation": SemanticBm25Result([candidate], [], None)}),
+        "hindsight_api.engine.memories.get_memories",
+        return_value=types.SimpleNamespace(
+            recall_unified=AsyncMock(return_value={"observation": SemanticBm25Result([candidate], [], None)})
+        ),
     ):
         outcome = await _dedup_adjudicate(
-            conn=AsyncMock(),
+            pool=AsyncMock(),
             memory_engine=types.SimpleNamespace(),
             bank_id="bank",
             config=types.SimpleNamespace(consolidation_dedup_threshold=0.97),
@@ -274,8 +277,12 @@ async def test_dedup_can_select_compatible_candidate_after_rejected_twin() -> No
 
     with (
         patch(
-            "hindsight_api.engine.search.retrieval.retrieve_semantic_bm25_combined",
-            AsyncMock(return_value={"observation": SemanticBm25Result([incompatible, compatible], [], None)}),
+            "hindsight_api.engine.memories.get_memories",
+            return_value=types.SimpleNamespace(
+                recall_unified=AsyncMock(
+                    return_value={"observation": SemanticBm25Result([incompatible, compatible], [], None)}
+                )
+            ),
         ),
         patch(
             "hindsight_api.engine.consolidation.consolidator.get_config",
@@ -283,10 +290,13 @@ async def test_dedup_can_select_compatible_candidate_after_rejected_twin() -> No
         ),
     ):
         outcome = await _dedup_adjudicate(
-            conn=AsyncMock(),
+            pool=AsyncMock(),
             memory_engine=types.SimpleNamespace(),
             bank_id="bank",
-            config=types.SimpleNamespace(consolidation_dedup_threshold=0.97),
+            config=types.SimpleNamespace(
+                consolidation_dedup_threshold=0.97,
+                llm_temperature_consolidation=0.2,
+            ),
             dedup_llm_config=llm,
             anchor_text=_PACKAGE_SOURCE,
             anchor_emb_str="[0.1, 0.2]",
@@ -392,11 +402,13 @@ async def test_dedup_uses_source_identity_when_generated_anchor_is_unknown() -> 
     llm = types.SimpleNamespace(call=AsyncMock())
 
     with patch(
-        "hindsight_api.engine.search.retrieval.retrieve_semantic_bm25_combined",
-        AsyncMock(return_value={"observation": SemanticBm25Result([candidate], [], None)}),
+        "hindsight_api.engine.memories.get_memories",
+        return_value=types.SimpleNamespace(
+            recall_unified=AsyncMock(return_value={"observation": SemanticBm25Result([candidate], [], None)})
+        ),
     ):
         outcome = await _dedup_adjudicate(
-            conn=AsyncMock(),
+            pool=AsyncMock(),
             memory_engine=types.SimpleNamespace(),
             bank_id="bank",
             config=types.SimpleNamespace(consolidation_dedup_threshold=0.97),
@@ -424,8 +436,10 @@ async def test_dedup_rejects_identity_drift_in_merged_text() -> None:
 
     with (
         patch(
-            "hindsight_api.engine.search.retrieval.retrieve_semantic_bm25_combined",
-            AsyncMock(return_value={"observation": SemanticBm25Result([candidate], [], None)}),
+            "hindsight_api.engine.memories.get_memories",
+            return_value=types.SimpleNamespace(
+                recall_unified=AsyncMock(return_value={"observation": SemanticBm25Result([candidate], [], None)})
+            ),
         ),
         patch(
             "hindsight_api.engine.consolidation.consolidator.get_config",
@@ -433,10 +447,13 @@ async def test_dedup_rejects_identity_drift_in_merged_text() -> None:
         ),
     ):
         outcome = await _dedup_adjudicate(
-            conn=AsyncMock(),
+            pool=AsyncMock(),
             memory_engine=types.SimpleNamespace(),
             bank_id="bank",
-            config=types.SimpleNamespace(consolidation_dedup_threshold=0.97),
+            config=types.SimpleNamespace(
+                consolidation_dedup_threshold=0.97,
+                llm_temperature_consolidation=0.2,
+            ),
             dedup_llm_config=llm,
             anchor_text=_PACKAGE_SOURCE,
             anchor_emb_str="[0.1, 0.2]",
@@ -461,8 +478,10 @@ async def test_incompatible_create_reconciliation_performs_no_write() -> None:
 
     with (
         patch(
-            "hindsight_api.engine.search.retrieval.retrieve_semantic_bm25_combined",
-            AsyncMock(return_value={"observation": SemanticBm25Result([candidate], [], None)}),
+            "hindsight_api.engine.memories.get_memories",
+            return_value=types.SimpleNamespace(
+                recall_unified=AsyncMock(return_value={"observation": SemanticBm25Result([candidate], [], None)})
+            ),
         ),
         patch(
             "hindsight_api.engine.consolidation.consolidator.embedding_utils.generate_embeddings_batch",
@@ -470,7 +489,7 @@ async def test_incompatible_create_reconciliation_performs_no_write() -> None:
         ),
     ):
         merged_into = await _dedup_reconcile_create(
-            conn=conn,
+            pool=conn,
             memory_engine=types.SimpleNamespace(embeddings=object()),
             bank_id="bank",
             config=types.SimpleNamespace(consolidation_dedup_threshold=0.97),
@@ -478,6 +497,7 @@ async def test_incompatible_create_reconciliation_performs_no_write() -> None:
             create_text="A source-root split was completed.",
             create_source_ids=[uuid.UUID(_PACKAGE_SOURCE_ID)],
             tags=[],
+            source_bounds=_TemporalBounds(),
             identity_axes=_axes(),
             source_identity_texts=(_PACKAGE_SOURCE,),
         )
@@ -498,11 +518,13 @@ async def test_incompatible_update_reconciliation_performs_no_write() -> None:
     llm = types.SimpleNamespace(call=AsyncMock())
 
     with patch(
-        "hindsight_api.engine.search.retrieval.retrieve_semantic_bm25_combined",
-        AsyncMock(return_value={"observation": SemanticBm25Result([candidate], [], None)}),
+        "hindsight_api.engine.memories.get_memories",
+        return_value=types.SimpleNamespace(
+            recall_unified=AsyncMock(return_value={"observation": SemanticBm25Result([candidate], [], None)})
+        ),
     ):
         await _dedup_reconcile_update(
-            conn=conn,
+            pool=conn,
             memory_engine=types.SimpleNamespace(embeddings=object()),
             bank_id="bank",
             config=types.SimpleNamespace(consolidation_dedup_threshold=0.97),

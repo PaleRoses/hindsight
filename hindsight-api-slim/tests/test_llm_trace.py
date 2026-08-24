@@ -96,6 +96,17 @@ def test_recorder_scope_allowlist():
     assert r.is_enabled("retain_extract_facts") is False
 
 
+def test_recorder_disabled_on_oracle_backend(monkeypatch):
+    # llm_requests is a PostgreSQL-only table, so on Oracle the recorder must
+    # report disabled and write nothing — otherwise every LLM call fires an
+    # INSERT that fails with ORA-00903 and spams the error log.
+    monkeypatch.setattr("hindsight_api.engine.schema._is_oracle", lambda: True)
+    rec = _CapturingRecorder()
+    assert rec.is_enabled("memory") is False
+    rec.record_llm_call(provider="mock", model="mock", scope="memory", messages=[], duration=0.1)
+    assert rec.records == []
+
+
 # ── recorder: record_llm_call builds correct records ──────────────────────────
 
 
@@ -218,6 +229,9 @@ class _StashThenRaiseProvider:
     def __init__(self, usage: llm_trace.LLMResponseUsage | None, exc: Exception):
         self._usage = usage
         self._exc = exc
+
+    def supports_attempt_scoped_concurrency(self) -> bool:
+        return False
 
     async def call(self, **_kwargs):
         if self._usage is not None:
@@ -522,6 +536,24 @@ async def test_list_empty(trace_api_client, bank_id):
 
 
 @pytest.mark.asyncio
+async def test_llm_requests_read_returns_empty_on_oracle(trace_api_client, bank_id, monkeypatch):
+    # llm_requests is PostgreSQL-only, so the list and stats read paths must
+    # return an empty result on Oracle rather than querying a table that does
+    # not exist there (ORA-00942). The bank still resolves (no 404).
+    await trace_api_client.put(f"/v1/default/banks/{bank_id}", json={"name": "Trace Bank"})
+    monkeypatch.setattr("hindsight_api.engine.schema._is_oracle", lambda: True)
+
+    listing = await trace_api_client.get(f"/v1/default/banks/{bank_id}/llm-requests")
+    assert listing.status_code == 200
+    assert listing.json()["items"] == []
+    assert listing.json()["total"] == 0
+
+    stats = await trace_api_client.get(f"/v1/default/banks/{bank_id}/llm-requests/stats")
+    assert stats.status_code == 200
+    assert stats.json()["buckets"] == []
+
+
+@pytest.mark.asyncio
 async def test_retain_creates_trace_rows_with_tokens(trace_api_client, bank_id):
     await trace_api_client.put(f"/v1/default/banks/{bank_id}", json={"name": "Trace Bank"})
     response = await trace_api_client.post(
@@ -723,6 +755,21 @@ async def test_stats_endpoint_includes_tokens(trace_api_client, bank_id):
 
 @pytest.mark.asyncio
 async def test_disabled_writes_no_rows(memory):
+    # Recorders live in a process-global registry, and this test can only prove
+    # anything about the one it disables. A recorder leaked by an earlier test is
+    # still enabled and still writing to the shared table, so it records this
+    # bank's retain and the count below comes back non-zero — with nothing in the
+    # failure naming the real cause (#2229). Assert the registry is clean first,
+    # so a leak reports itself instead of arriving as `assert 4 == 0`.
+    from hindsight_api.engine.llm_trace import LLMTraceRecorder
+    from hindsight_api.tracing import get_span_recorder
+
+    registered = [r for r in get_span_recorder()._recorders if isinstance(r, LLMTraceRecorder)]
+    assert registered == [memory._llm_recorder], (
+        f"{len(registered)} LLM trace recorder(s) registered, expected only this engine's — "
+        "an earlier test leaked one into the global registry (#2229)"
+    )
+
     memory._llm_recorder._enabled = False
 
     app = create_app(memory, initialize_memory=False)

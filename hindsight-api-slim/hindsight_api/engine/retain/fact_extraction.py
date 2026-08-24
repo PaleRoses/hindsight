@@ -14,7 +14,7 @@ from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
 
-from ..llm_interface import ProviderRateLimitResetError
+from ..llm_interface import ProviderContentPolicyError, ProviderRateLimitResetError
 from ..llm_wrapper import LLMConfig, OutputTooLongError, parse_llm_json, sanitize_llm_output
 from ..operation_metadata import RetainExtractionErrors
 from ..response_models import TokenUsage
@@ -229,23 +229,6 @@ class ExtractedFact(BaseModel):
     def ensure_entities_list(cls, v):
         return _coerce_entity_strings(v)
 
-    def build_fact_text(self) -> str:
-        """Combine all dimensions into a single comprehensive fact string."""
-        parts = [self.what]
-
-        # Add 'who' if not N/A
-        if self.who and self.who.upper() != "N/A":
-            parts.append(f"Involving: {self.who}")
-
-        # Add 'why' if not N/A
-        if self.why and self.why.upper() != "N/A":
-            parts.append(self.why)
-
-        if len(parts) == 1:
-            return parts[0]
-
-        return " | ".join(parts)
-
 
 class FactExtractionResponse(BaseModel):
     """Response containing all extracted facts (causal relations are embedded in each fact)."""
@@ -253,10 +236,20 @@ class FactExtractionResponse(BaseModel):
     facts: list[ExtractedFact] = Field(description="List of extracted factual statements")
 
 
+# Below this size, splitting an over-long chunk further cannot help: if a chunk
+# this small still overflows the model's output cap, the cause is degenerate or
+# looping model output rather than genuinely dense input, and halving it just
+# recurses toward a single character. A few-hundred-character floor bounds that
+# runaway (an all-sizes-overflow 3000-char chunk drops in ~17 extraction calls
+# instead of ~5000) while staying well under any chunk that legitimately holds
+# enough facts to exceed the cap.
+_MIN_SPLIT_CHUNK_CHARS = 500
+
+
 def _split_chunk_for_output_retry(chunk: str) -> tuple[str, str] | None:
     """Split an oversized extraction chunk without corrupting structured input."""
     stripped = chunk.strip()
-    if len(stripped) <= 1:
+    if len(stripped) <= _MIN_SPLIT_CHUNK_CHARS:
         return None
 
     try:
@@ -1137,9 +1130,9 @@ def _build_extraction_prompt_and_schema(config) -> tuple[str, type]:
         base_response_class = FactExtractionResponseNoCausal
 
     # Add entity labels section if configured and build dynamic schema
-    entity_labels_raw = getattr(config, "entity_labels", None)
+    entity_labels_raw = config.entity_labels
     labels_cfg = parse_entity_labels(entity_labels_raw)
-    free_form_entities = getattr(config, "entities_allow_free_form", True)
+    free_form_entities = config.entities_allow_free_form
     labels_section = _build_labels_prompt_section(labels_cfg, free_form_entities)
     if labels_section:
         prompt = prompt + labels_section
@@ -1152,7 +1145,7 @@ def _build_extraction_prompt_and_schema(config) -> tuple[str, type]:
     # tokenization and LLM output language are separate concerns.
     from ..prompt_utils import output_language_directive
 
-    prompt = prompt + output_language_directive(getattr(config, "llm_output_language", None))
+    prompt = prompt + output_language_directive(config.llm_output_language)
 
     response_schema = base_response_class
 
@@ -1200,7 +1193,7 @@ def _retain_mission_preamble(config) -> str:
     No brace-escaping needed: unlike the system template, the user message is
     used verbatim, not passed through str.format().
     """
-    retain_mission = getattr(config, "retain_mission", None)
+    retain_mission = config.retain_mission
     if not retain_mission:
         return ""
     return (
@@ -1269,10 +1262,17 @@ Text:
 {sanitized_chunk}"""
 
 
-def _build_request_body(llm_config, config, prompt: str, user_message: str, response_schema: type) -> dict:
-    """Build request body for LLM API call."""
+def _build_request_body(batch_impl, config, prompt: str, user_message: str, response_schema: type) -> dict:
+    """Build request body for the batch LLM API call.
+
+    ``batch_impl`` is the provider implementation that will serve the batch. For
+    a multi-LLM chain this is the first batch-capable member (see
+    ``MultiLLMProvider.batch_provider_impl``), not necessarily the primary — so
+    ``model``/``provider``/``service_tier`` must come from THIS impl, matching the
+    account the batch is submitted to.
+    """
     request_body = {
-        "model": llm_config.model,
+        "model": batch_impl.model,
         "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": user_message}],
     }
 
@@ -1289,9 +1289,12 @@ def _build_request_body(llm_config, config, prompt: str, user_message: str, resp
     if config.retain_max_completion_tokens:
         request_body["max_completion_tokens"] = config.retain_max_completion_tokens
 
-    # Add service_tier for OpenAI Flex Processing
-    if llm_config.provider == "openai" and llm_config._provider_impl.openai_service_tier:
-        request_body["service_tier"] = llm_config._provider_impl.openai_service_tier
+    # Add service_tier for OpenAI Flex Processing. ``provider`` is set by every
+    # LLMInterface, and the short-circuit keeps impls without a service tier
+    # (gemini/anthropic/fireworks) from ever reaching the second attribute — so a
+    # renamed field fails loudly here instead of silently dropping flex pricing.
+    if batch_impl.provider == "openai" and batch_impl.openai_service_tier:
+        request_body["service_tier"] = batch_impl.openai_service_tier
 
     # Add response_format (JSON schema). The batch path builds the request body
     # directly instead of going through LLMProvider.call(), so resolve the
@@ -1300,12 +1303,11 @@ def _build_request_body(llm_config, config, prompt: str, user_message: str, resp
     # retain-scoped field, which already folds in the global HINDSIGHT_API_LLM_STRICT_SCHEMA
     # fallback, so the batch and streaming paths can't disagree.
     if hasattr(response_schema, "model_json_schema"):
-        schema = (
-            strict_json_schema(response_schema) if config.llm_strict_schema else response_schema.model_json_schema()
-        )
+        retain_strict_schema = config.llm_strict_schema_retain
+        schema = strict_json_schema(response_schema) if retain_strict_schema else response_schema.model_json_schema()
         request_body["response_format"] = {
             "type": "json_schema",
-            "json_schema": {"name": "facts", "schema": schema, "strict": config.llm_strict_schema_retain},
+            "json_schema": {"name": "facts", "schema": schema, "strict": retain_strict_schema},
         }
 
     return request_body
@@ -1550,9 +1552,9 @@ async def _extract_facts_from_chunk(
                 validated_entities = _coerce_entity_strings(get_value("entities"))
 
                 # Post-process label entities from structured labels object
-                entity_labels_raw = getattr(config, "entity_labels", None)
+                entity_labels_raw = config.entity_labels
                 labels_cfg = parse_entity_labels(entity_labels_raw)
-                free_form_entities = getattr(config, "entities_allow_free_form", True)
+                free_form_entities = config.entities_allow_free_form
                 if labels_cfg and labels_cfg.attributes:
                     labels_lookup = build_labels_lookup(labels_cfg)
                     labels_data = llm_fact.get("labels") or {}
@@ -1912,6 +1914,21 @@ async def extract_facts_from_text(
                 ),
             ) from quota_errors[0]
 
+        # A content-policy refusal is deterministic: the offending chunk earns
+        # the same refusal on every replay, so no amount of task-level retrying
+        # can complete this retain. Re-raise the permanent type (rather than a
+        # generic RuntimeError) so the worker fails the operation immediately
+        # instead of burning a full retry schedule on it (issue #3690). One
+        # refused chunk is enough — the retain cannot succeed while it is in the
+        # batch, whatever the other failures were.
+        policy_errors = [err for _, err in failed_chunks if isinstance(err, ProviderContentPolicyError)]
+        if policy_errors:
+            raise ProviderContentPolicyError(
+                f"Fact extraction refused by provider content policy: {len(policy_errors)} of "
+                f"{len(failed_chunks)} failed chunks ({len(chunks)} total) were refused; retrying cannot "
+                f"succeed. First failures: {failed_summary}"
+            ) from policy_errors[0]
+
         # Fail the entire retain — partial extraction is not acceptable.
         # All successfully extracted facts are discarded because the transaction
         # hasn't committed yet. The worker poller will retry the entire task.
@@ -2007,16 +2024,13 @@ async def extract_facts_from_contents_batch_api(
     # Check config for causal link extraction (used throughout)
     extract_causal_links = config.retain_extract_causal_links
 
-    # Check if provider supports batch API
-    if not await llm_config._provider_impl.supports_batch_api():
-        raise RuntimeError(
-            f"retain_batch_enabled=True but provider '{llm_config.provider}' does not "
-            f"support the batch API. This should have been caught at startup — check "
-            f"HINDSIGHT_API_RETAIN_BATCH_ENABLED and your LLM provider configuration."
-        )
-
-    # Check if we're resuming an existing batch (crash recovery)
+    # Check if we're resuming an existing batch (crash recovery). This is read
+    # BEFORE the serving member is resolved: a resume must target the account
+    # that owns the batch, not whichever member the current configuration would
+    # pick for a fresh one.
     batch_id = None
+    submitted_account: str | None = None
+    submitted_provider: str | None = None
     if operation_id and pool:
         from ..db_utils import acquire_with_retry
         from ..task_backend import fq_table
@@ -2033,9 +2047,54 @@ async def extract_facts_from_contents_batch_api(
             if isinstance(metadata, str):
                 metadata = json.loads(metadata)
             batch_id = metadata.get("batch_id")
-
             if batch_id:
-                logger.info(f"Resuming existing batch: batch_id={batch_id} (crash recovery)")
+                submitted_account = metadata.get("batch_account")
+                submitted_provider = metadata.get("batch_provider")
+
+    # Resolve the provider implementation that serves the batch. For a multi-LLM
+    # chain a fresh batch goes to the first batch-capable member (not necessarily
+    # the primary); for a single provider it is the primary itself, and ``None``
+    # when nothing configured can serve a batch at all. The whole batch lifecycle
+    # (submit → poll → retrieve) must target this ONE impl, so resolve it once
+    # and reuse it.
+    #
+    # Resuming pins the lookup to the account that submitted the batch. The chain
+    # configuration can change between submit and resume — a member added,
+    # removed, reordered, or given batch capacity — and two members of the same
+    # provider on different credentials are indistinguishable by provider name,
+    # so "first batch-capable member" can resolve to an account that has never
+    # seen this batch id (#3671).
+    batch_impl = await llm_config.batch_provider_impl(account_key=submitted_account)
+
+    if batch_impl is None:
+        if batch_id:
+            # Polling an account that does not own the batch would hang until the
+            # wall clock ran out and then report a provider error nobody can act
+            # on. Fail before the first poll instead, naming both sides.
+            raise RuntimeError(
+                f"Cannot resume batch {batch_id}: it was submitted by the LLM member "
+                f"'{submitted_account or submitted_provider}', which the retain LLM "
+                f"configuration no longer serves batch from. Restore the LLM member "
+                f"(provider, base URL and API key) that submitted it, or fail this "
+                f"operation and retain again."
+            )
+        raise RuntimeError(
+            f"retain_batch_enabled=True but provider '{llm_config.provider}' does not "
+            f"support the batch API. This should have been caught at startup — check "
+            f"HINDSIGHT_API_RETAIN_BATCH_ENABLED and your LLM provider configuration."
+        )
+
+    if batch_id:
+        # Batches submitted before ``batch_account`` was persisted carry only the
+        # provider name; keep guarding those on the coarse signal we do have.
+        if submitted_account is None and submitted_provider and submitted_provider != batch_impl.provider:
+            raise RuntimeError(
+                f"Cannot resume batch {batch_id}: it was submitted to "
+                f"'{submitted_provider}' but the retain LLM configuration now "
+                f"serves batch from '{batch_impl.provider}'. Restore the LLM "
+                f"member that submitted it, or fail this operation and retain again."
+            )
+        logger.info(f"Resuming existing batch: batch_id={batch_id} (crash recovery)")
 
     # Step 1: Chunk all contents and build batch requests (skip if resuming)
     all_chunks_info = []  # List of (chunk_text, content_index, chunk_index_in_content, event_date, context)
@@ -2070,7 +2129,7 @@ async def extract_facts_from_contents_batch_api(
             )
 
             # Build request body using helper function
-            request_body = _build_request_body(llm_config, config, prompt, user_message, response_schema)
+            request_body = _build_request_body(batch_impl, config, prompt, user_message, response_schema)
 
             batch_requests.append(
                 {"custom_id": custom_id, "method": "POST", "url": "/v1/chat/completions", "body": request_body}
@@ -2083,7 +2142,7 @@ async def extract_facts_from_contents_batch_api(
     if not batch_id:
         logger.info(f"Submitting batch with {len(batch_requests)} chunk requests")
 
-        batch_metadata = await llm_config._provider_impl.submit_batch(batch_requests)
+        batch_metadata = await batch_impl.submit_batch(batch_requests)
         batch_id = batch_metadata["batch_id"]
 
         logger.info(f"Batch submitted: {batch_id}, polling every {config.retain_batch_poll_interval_seconds}s")
@@ -2093,7 +2152,11 @@ async def extract_facts_from_contents_batch_api(
         if operation_id and pool:
             batch_state = {
                 "batch_id": batch_id,
-                "batch_provider": llm_config.provider,
+                "batch_provider": batch_impl.provider,
+                # Binds the batch to the exact account that owns it, so a resume
+                # after a member reorder resolves that account instead of a
+                # same-provider lookalike (#3671). Non-secret by construction.
+                "batch_account": batch_impl.batch_account_key,
                 "chunk_count": len(batch_requests),
             }
 
@@ -2121,7 +2184,7 @@ async def extract_facts_from_contents_batch_api(
 
     start_time = time.time()
     while True:
-        status_info = await llm_config._provider_impl.get_batch_status(batch_id)
+        status_info = await batch_impl.get_batch_status(batch_id)
         status = status_info["status"]
 
         elapsed = time.time() - start_time
@@ -2143,7 +2206,7 @@ async def extract_facts_from_contents_batch_api(
     logger.info(f"Batch {batch_id} completed in {elapsed:.0f}s, retrieving results")
 
     # Step 4: Retrieve results
-    batch_results = await llm_config._provider_impl.retrieve_batch_results(batch_id)
+    batch_results = await batch_impl.retrieve_batch_results(batch_id)
 
     # Map results by custom_id
     results_by_id = {result["custom_id"]: result for result in batch_results}
@@ -2304,9 +2367,9 @@ async def extract_facts_from_contents_batch_api(
             validated_entities = _coerce_entity_strings(get_value("entities"))
 
             # Post-process label entities from structured labels object
-            entity_labels_raw = getattr(config, "entity_labels", None)
+            entity_labels_raw = config.entity_labels
             labels_cfg_batch = parse_entity_labels(entity_labels_raw)
-            free_form_entities_batch = getattr(config, "entities_allow_free_form", True)
+            free_form_entities_batch = config.entities_allow_free_form
             if labels_cfg_batch and labels_cfg_batch.attributes:
                 labels_lookup_batch = build_labels_lookup(labels_cfg_batch)
                 labels_data = llm_fact.get("labels") or {}
@@ -2565,8 +2628,7 @@ async def extract_facts_from_contents(
     # Step 1: Create parallel fact extraction tasks
     fact_extraction_tasks = []
     for item in contents:
-        # Call extract_facts_from_text directly (defined earlier in this file)
-        # to avoid circular import with utils.extract_facts
+        # Call extract_facts_from_text directly (defined earlier in this file).
         task = extract_facts_from_text(
             text=item.content,
             event_date=item.event_date,
@@ -2766,7 +2828,7 @@ def _inject_label_tags(facts: list[ExtractedFactType], config) -> None:
     This lets entity labels double as tags, enabling filtering via the
     existing tags API without any extra query infrastructure.
     """
-    labels_cfg = parse_entity_labels(getattr(config, "entity_labels", None))
+    labels_cfg = parse_entity_labels(config.entity_labels)
     if not labels_cfg:
         return
     tag_group_keys = {g.key.lower() for g in labels_cfg.attributes if g.tag}

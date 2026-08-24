@@ -46,21 +46,134 @@ async def test_duplicate_document_ids_rejected_async(memory, request_context):
 
 
 @pytest.mark.asyncio
-async def test_duplicate_document_ids_rejected_sync(memory, request_context):
-    """Test that sync retain also rejects batches with duplicate document_ids."""
-    bank_id = "test_duplicate_sync"
-    contents = [
-        {"content": "First item", "document_id": "doc1"},
-        {"content": "Second item", "document_id": "doc1"},  # Duplicate!
-    ]
+async def test_shared_document_id_folds_sync(memory, request_context):
+    """Sync retain accepts several items sharing one document_id and folds them
+    into a single document, in request order (the documented RetainRequest
+    example — see issue #3363)."""
+    bank_id = f"test_shared_doc_sync_{uuid.uuid4().hex}"
+    try:
+        contents = [
+            {"content": "Alice works at Google", "context": "work", "document_id": "conversation_123"},
+            {"content": "Bob went hiking yesterday", "document_id": "conversation_123"},
+        ]
 
-    # Should raise ValueError due to duplicate document_ids
-    with pytest.raises(ValueError, match="duplicate document_ids.*doc1"):
-        await memory.retain_batch_async(
+        # Must NOT raise (this used to be a 400).
+        result = await memory.retain_batch_async(
             bank_id=bank_id,
             contents=contents,
             request_context=request_context,
         )
+        # One result slot per input content is preserved.
+        assert len(result) == 2
+
+        # The items folded into exactly one document.
+        docs = await memory.list_documents(bank_id=bank_id, request_context=request_context)
+        assert docs["total"] == 1
+        assert docs["items"][0]["id"] == "conversation_123"
+
+        # Both items' content lands in that one document's body, in order.
+        doc = await memory.get_document("conversation_123", bank_id, request_context=request_context)
+        body = doc["original_text"]
+        assert "Alice works at Google" in body
+        assert "Bob went hiking yesterday" in body
+        assert body.index("Alice works at Google") < body.index("Bob went hiking yesterday")
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_batch_level_document_id_folds_sync(memory, request_context):
+    """The deprecated batch-level document_id (applied to every item without its
+    own) folds those items into one document instead of tripping the guard."""
+    bank_id = f"test_batch_doc_id_sync_{uuid.uuid4().hex}"
+    try:
+        result = await memory.retain_batch_async(
+            bank_id=bank_id,
+            contents=[
+                {"content": "Alice works at Google"},
+                {"content": "Bob loves Python"},
+            ],
+            document_id="meeting-2024-01-15",
+            request_context=request_context,
+        )
+        assert len(result) == 2
+
+        docs = await memory.list_documents(bank_id=bank_id, request_context=request_context)
+        assert docs["total"] == 1
+        assert docs["items"][0]["id"] == "meeting-2024-01-15"
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_shared_and_distinct_document_ids_sync(memory, request_context):
+    """A batch mixing a shared document_id with a distinct one folds only the
+    shared items, leaving the distinct document on its own."""
+    bank_id = f"test_mixed_doc_ids_sync_{uuid.uuid4().hex}"
+    try:
+        result = await memory.retain_batch_async(
+            bank_id=bank_id,
+            contents=[
+                {"content": "Alice works at Google", "document_id": "docA"},
+                {"content": "Bob loves Python", "document_id": "docB"},
+                {"content": "Alice also mentors interns", "document_id": "docA"},
+            ],
+            request_context=request_context,
+        )
+        assert len(result) == 3
+
+        docs = await memory.list_documents(bank_id=bank_id, request_context=request_context)
+        assert docs["total"] == 2
+
+        doc_a = await memory.get_document("docA", bank_id, request_context=request_context)
+        assert "Alice works at Google" in doc_a["original_text"]
+        assert "Alice also mentors interns" in doc_a["original_text"]
+
+        doc_b = await memory.get_document("docB", bank_id, request_context=request_context)
+        assert "Bob loves Python" in doc_b["original_text"]
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_shared_document_id_folds_sync_large_batch(memory, request_context):
+    """A shared-document batch large enough to exceed the auto-split token
+    threshold still folds into one document with NO lost content. Splitting one
+    document across sub-batches would trip the streaming pipeline's content-hash
+    ownership check and drop later sub-batches, so shared groups take a single
+    pass — this guards that decision (issue #3363)."""
+    from hindsight_api.engine.memory_engine import count_tokens
+
+    bank_id = f"test_shared_doc_large_sync_{uuid.uuid4().hex}"
+    try:
+        # Two ~5.5k-token items sharing one document_id → ~11k tokens, over the
+        # 10k default split threshold. Distinct markers pin each item's presence.
+        filler = "The quick brown fox jumps over the lazy dog. " * 500
+        contents = [
+            {"content": f"MARKER_ALPHA at the start. {filler}", "document_id": "big_conversation"},
+            {"content": f"{filler} MARKER_OMEGA at the end.", "document_id": "big_conversation"},
+        ]
+        assert sum(count_tokens(c["content"]) for c in contents) > 10_000
+
+        result = await memory.retain_batch_async(
+            bank_id=bank_id,
+            contents=contents,
+            request_context=request_context,
+        )
+        assert len(result) == 2
+
+        docs = await memory.list_documents(bank_id=bank_id, request_context=request_context)
+        assert docs["total"] == 1
+
+        # Both items survive — neither sub-batch was dropped by a takeover abort.
+        doc = await memory.get_document("big_conversation", bank_id, request_context=request_context)
+        assert "MARKER_ALPHA" in doc["original_text"]
+        assert "MARKER_OMEGA" in doc["original_text"]
+
+        chunks = await memory.list_document_chunks(bank_id, "big_conversation", request_context=request_context)
+        assert chunks["total"] > 1
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
 
 
 @pytest.mark.asyncio
@@ -551,6 +664,7 @@ async def test_all_degenerate_facts_still_persist_document_chunks(memory, reques
 
 
 @pytest.mark.asyncio
+@pytest.mark.memory_backend_incompatible
 async def test_streaming_offsets_chunk_local_causal_fact_indices(memory, request_context, monkeypatch):
     """Causal targets from independently extracted chunks must stay within their source chunk."""
     from hindsight_api.engine.response_models import TokenUsage
@@ -652,17 +766,24 @@ async def test_degenerate_fact_preserves_later_chunk_provenance(memory, request_
             request_context=request_context,
         )
 
-        pool = await memory._get_pool()
-        rows = await pool.fetch(
-            """
-            SELECT units.text AS fact_text, chunks.chunk_index AS chunk_index
-            FROM memory_units units
-            JOIN chunks ON chunks.chunk_id = units.chunk_id
-            WHERE units.bank_id = $1
-            """,
-            bank_id,
-        )
-        assert {(row["fact_text"], row["chunk_index"]) for row in rows} == {
+        # Each fact carries the chunk it came from, and the document's chunks carry
+        # their index, so the join the assertion needs is over two API reads.
+        chunk_index_by_id = {
+            chunk["chunk_id"]: chunk["chunk_index"]
+            for chunk in (
+                await memory.list_document_chunks(
+                    bank_id, "degen-provenance-document", limit=500, request_context=request_context
+                )
+            )["items"]
+        }
+        units = (await memory.list_memory_units(bank_id, limit=500, request_context=request_context))["items"]
+        # Chunkless units (an observation, say) were dropped by the inner join before
+        # and are dropped here for the same reason: they have no provenance to check.
+        assert {
+            (unit["text"], chunk_index_by_id[unit["chunk_id"]])
+            for unit in units
+            if unit["chunk_id"] in chunk_index_by_id
+        } == {
             ("chunk zero real fact", 0),
             ("chunk one real fact", 1),
         }
@@ -1432,3 +1553,153 @@ async def test_submit_async_batch_retain_rolls_back_missing_bank_on_child_failur
 
     bank = await pool.fetchrow("SELECT bank_id FROM banks WHERE bank_id = $1", bank_id)
     assert bank is None, "the lazily-created bank must roll back with the failed operation inserts"
+
+
+# ── retrying a batch_retain parent re-runs its outstanding children ─────────
+# Regression for #2985's retry guard, which rejected *every* payload-null
+# batch_retain parent — that made `retain --async` operations un-retryable
+# (their operation_id is always such a parent) and 409'd the operations doc
+# example. Retry now re-queues the parent's failed/cancelled children and
+# revives the parent, without touching in-flight children or re-stranding a
+# parent whose work is already done.
+
+
+async def _insert_parent(conn, bank_id: str, parent_id, status: str) -> None:
+    await conn.execute(
+        "INSERT INTO banks (bank_id, name) VALUES ($1, $1) ON CONFLICT DO NOTHING",
+        bank_id,
+    )
+    await conn.execute(
+        "INSERT INTO async_operations (operation_id, bank_id, operation_type, status, result_metadata) "
+        "VALUES ($1, $2, 'batch_retain', $3, $4::jsonb)",
+        parent_id,
+        bank_id,
+        status,
+        json.dumps({"is_parent": True}),
+    )
+
+
+async def _insert_child(conn, bank_id: str, child_id, parent_id, status: str) -> None:
+    await conn.execute(
+        "INSERT INTO async_operations "
+        "(operation_id, bank_id, operation_type, status, task_payload, result_metadata) "
+        "VALUES ($1, $2, 'retain', $3, $4::jsonb, $5::jsonb)",
+        child_id,
+        bank_id,
+        status,
+        json.dumps({"contents": []}),
+        json.dumps({"parent_operation_id": str(parent_id)}),
+    )
+
+
+@pytest.mark.asyncio
+async def test_retry_batch_parent_requeues_failed_child_and_revives_parent(memory, request_context):
+    from hindsight_api.engine.db_utils import acquire_with_retry
+
+    bank_id = f"retry-parent-{uuid.uuid4().hex[:8]}"
+    parent_id, child_id = uuid.uuid4(), uuid.uuid4()
+    backend = await memory._get_backend()
+    async with acquire_with_retry(backend) as conn:
+        await _insert_parent(conn, bank_id, parent_id, "cancelled")
+        await _insert_child(conn, bank_id, child_id, parent_id, "failed")
+
+    result = await memory.retry_operation(bank_id, str(parent_id), request_context=request_context)
+    assert result["success"] is True
+
+    async with acquire_with_retry(backend) as conn:
+        rows = {
+            r["operation_id"]: r["status"]
+            for r in await conn.fetch("SELECT operation_id, status FROM async_operations WHERE bank_id = $1", bank_id)
+        }
+    assert rows[child_id] == "pending", "the failed child must be re-queued"
+    assert rows[parent_id] == "pending", "the parent must be revived so it re-aggregates"
+
+
+@pytest.mark.asyncio
+async def test_retry_batch_parent_leaves_processing_child_untouched(memory, request_context):
+    # A 'processing' child is owned by a live worker; resetting it would let a
+    # second worker race it on the same document_id (#1795). Retry must revive
+    # the parent (the processing child is non-completed) but not touch the child.
+    from hindsight_api.engine.db_utils import acquire_with_retry
+
+    bank_id = f"retry-parent-{uuid.uuid4().hex[:8]}"
+    parent_id, child_id = uuid.uuid4(), uuid.uuid4()
+    backend = await memory._get_backend()
+    async with acquire_with_retry(backend) as conn:
+        await _insert_parent(conn, bank_id, parent_id, "cancelled")
+        await _insert_child(conn, bank_id, child_id, parent_id, "processing")
+
+    result = await memory.retry_operation(bank_id, str(parent_id), request_context=request_context)
+    assert result["success"] is True
+
+    async with acquire_with_retry(backend) as conn:
+        rows = {
+            r["operation_id"]: r["status"]
+            for r in await conn.fetch("SELECT operation_id, status FROM async_operations WHERE bank_id = $1", bank_id)
+        }
+    assert rows[child_id] == "processing", "an in-flight child must not be reset"
+    assert rows[parent_id] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_retry_batch_parent_all_children_completed_is_rejected(memory, request_context):
+    from hindsight_api.engine.db_utils import acquire_with_retry
+    from hindsight_api.extensions import OperationValidationError
+
+    bank_id = f"retry-parent-{uuid.uuid4().hex[:8]}"
+    parent_id, child_id = uuid.uuid4(), uuid.uuid4()
+    backend = await memory._get_backend()
+    async with acquire_with_retry(backend) as conn:
+        await _insert_parent(conn, bank_id, parent_id, "cancelled")
+        await _insert_child(conn, bank_id, child_id, parent_id, "completed")
+
+    with pytest.raises(OperationValidationError) as exc:
+        await memory.retry_operation(bank_id, str(parent_id), request_context=request_context)
+    assert exc.value.status_code == 409
+
+    async with acquire_with_retry(backend) as conn:
+        parent = await conn.fetchrow("SELECT status FROM async_operations WHERE operation_id = $1", parent_id)
+    assert parent["status"] == "cancelled", "a parent with no retryable work must not be revived (no re-strand)"
+
+
+@pytest.mark.asyncio
+async def test_single_document_retain_surfaces_document_id(memory, request_context):
+    """A single-document async retain (e.g. a document reprocess) surfaces its
+    target document_id in the operations list, so the documents UI can cross-check
+    pending/processing ops and badge that row as "updating" while it's in flight.
+    """
+    bank_id = "test_single_doc_update"
+    await memory.submit_async_retain(
+        bank_id=bank_id,
+        contents=[{"content": "Alice works at Google", "document_id": "report_2024"}],
+        request_context=request_context,
+    )
+
+    ops = (await memory.list_operations(bank_id, request_context=request_context))["operations"]
+    parents = [op for op in ops if op["task_type"] == "batch_retain"]
+    assert parents, "expected a batch_retain parent operation"
+    # Both the parent and its single child should carry the document_id.
+    assert all(op["document_id"] == "report_2024" for op in ops if op["task_type"] == "batch_retain")
+
+
+@pytest.mark.asyncio
+async def test_multi_document_batch_does_not_misattribute_document_id(memory, request_context):
+    """A batch that packs several documents into one child must NOT claim a single
+    document_id — that would badge the wrong row. The document_id is surfaced only
+    when an operation genuinely targets exactly one document.
+    """
+    bank_id = "test_multi_doc_update"
+    await memory.submit_async_retain(
+        bank_id=bank_id,
+        contents=[
+            {"content": "Alice works at Google", "document_id": "doc_a"},
+            {"content": "Bob loves Python", "document_id": "doc_b"},
+        ],
+        request_context=request_context,
+    )
+
+    ops = (await memory.list_operations(bank_id, request_context=request_context))["operations"]
+    # These two small items pack into one multi-document child, so neither the
+    # parent nor the child resolves to a single document_id.
+    assert ops, "expected operations for the batch"
+    assert all(op["document_id"] is None for op in ops)

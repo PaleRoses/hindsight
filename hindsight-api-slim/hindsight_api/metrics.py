@@ -292,6 +292,10 @@ class MetricsCollectorBase:
         """Context manager to record HTTP request metrics."""
         raise NotImplementedError
 
+    def record_retain_document(self, bank_id: str, memory_unit_count: int):
+        """Record the fact-extraction outcome of one document processed by retain."""
+        raise NotImplementedError
+
     def record_db_acquire_wait(self, wait_seconds: float):
         """Record how long a caller waited to acquire a pooled DB connection."""
         raise NotImplementedError
@@ -352,6 +356,10 @@ class NoOpMetricsCollector(MetricsCollectorBase):
     def record_http_request(self, method: str, endpoint: str, status_code_getter: Callable[[], int]):
         """No-op HTTP request recording."""
         yield
+
+    def record_retain_document(self, bank_id: str, memory_unit_count: int):
+        """No-op retain document outcome recording."""
+        pass
 
     def record_db_acquire_wait(self, wait_seconds: float):
         """No-op DB acquire-wait recording."""
@@ -425,6 +433,18 @@ class MetricsCollector(MetricsCollectorBase):
             description="Number of reasoning/thinking tokens emitted by the model "
             "(billed as output but not surfaced in candidates)",
             unit="tokens",
+        )
+
+        # Per-document retain outcome. The point of this counter is the
+        # ``outcome=no_facts`` series: a document whose extraction legitimately
+        # produced zero facts is stored but unreachable via recall/reflect (only
+        # memory_units carry embeddings), and nothing else in the system reports
+        # it — the operation still completes successfully. Alert on it to catch a
+        # retain_mission that silently excludes more than intended (issue #3040).
+        self.retain_documents_total = self.meter.create_counter(
+            name="hindsight.retain.documents.total",
+            description="Documents processed by retain, labelled by extraction outcome (facts/no_facts)",
+            unit="documents",
         )
 
         # HTTP request metrics
@@ -562,6 +582,22 @@ class MetricsCollector(MetricsCollectorBase):
 
         # Record operation count
         self.operation_total.add(1, attributes)
+
+    def record_retain_document(self, bank_id: str, memory_unit_count: int):
+        """Record one document's retain outcome.
+
+        ``memory_unit_count == 0`` means fact extraction ran and returned
+        nothing, so the document is stored but unreachable through recall/reflect
+        until it is reprocessed.
+        """
+        attributes = {
+            "tenant": _get_tenant(),
+            "outcome": "facts" if memory_unit_count > 0 else "no_facts",
+        }
+        if self._include_bank_id:
+            attributes["bank_id"] = bank_id
+
+        self.retain_documents_total.add(1, attributes)
 
     def record_llm_call(
         self,
@@ -918,7 +954,8 @@ class MetricsCollector(MetricsCollectorBase):
         self.meter.create_observable_gauge(
             name="hindsight.consolidation.backlog",
             callbacks=[get_consolidation_backlog],
-            description="Source memories (experience/world) not yet consolidated into observations",
+            description="Source memories (experience/world) still queued for consolidation into "
+            "observations; excludes permanently failed ones, which are in hindsight.consolidation.failed",
             unit="{memories}",
         )
         self.meter.create_observable_gauge(
@@ -1007,6 +1044,14 @@ class MetricsCollector(MetricsCollectorBase):
                 #   idx_memory_units_consolidation_failed  WHERE consolidation_failed_at IS NOT NULL ...
                 # GROUP BY bank_id still composes — bank_id is each index's lead column.
                 #
+                # The backlog gauge is disjoint from the failed gauge: it carries the
+                # consolidator's own `consolidation_failed_at IS NULL` (see
+                # reads.find_unconsolidated), so a permanently failed fact does not hold
+                # the backlog above zero forever and "backlog > 0 for N minutes" stays an
+                # alertable condition. That extra term is not in the partial index's
+                # predicate, so it is a cheap recheck on the rows the index already
+                # returned — the failed set is tiny by construction.
+                #
                 # The backlog count runs with seqscan disabled in a scoped
                 # transaction. The partial index matches its predicate, but
                 # `consolidated_at IS NULL` is true for a large fraction of the
@@ -1023,7 +1068,8 @@ class MetricsCollector(MetricsCollectorBase):
                         rows = await conn.fetch(
                             f"SELECT {bank_sel}COUNT(*) AS count "
                             f'FROM "{schema}".memory_units '
-                            "WHERE consolidated_at IS NULL AND fact_type IN ('experience', 'world')"
+                            "WHERE consolidated_at IS NULL AND consolidation_failed_at IS NULL "
+                            "AND fact_type IN ('experience', 'world')"
                             f"{bank_grp}"
                         )
                     for row in rows:

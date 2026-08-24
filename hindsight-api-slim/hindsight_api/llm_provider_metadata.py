@@ -22,6 +22,7 @@ class LLMProviderMetadata:
 
 _PROVIDER_METADATA = (
     LLMProviderMetadata("openai", True, "gpt-4o-mini", openai_compatible=True),
+    LLMProviderMetadata("openai-responses", True, "gpt-5.6"),
     LLMProviderMetadata("anthropic", True, "claude-haiku-4-5"),
     LLMProviderMetadata("gemini", True, "gemini-3.5-flash"),
     LLMProviderMetadata(
@@ -47,6 +48,7 @@ _PROVIDER_METADATA = (
     LLMProviderMetadata("vertexai", False, "google/gemini-3.1-flash-lite"),
     LLMProviderMetadata("openai-codex", False, "gpt-5.4-mini", "https://chatgpt.com/backend-api"),
     LLMProviderMetadata("claude-code", False, "claude-sonnet-4-5-20250929"),
+    LLMProviderMetadata("github-copilot", False, "gpt-5.6-terra"),
     LLMProviderMetadata("mock", False, "mock-model"),
     LLMProviderMetadata("none", False, "none"),
     LLMProviderMetadata("litellm", False, "gpt-4o-mini"),
@@ -70,6 +72,7 @@ _PROVIDER_METADATA = (
         "deepseek/deepseek-v4-flash",
         "https://inference-api.nousresearch.com/v1",
     ),
+    LLMProviderMetadata("xai-oauth", False, "grok-4.5"),
 )
 
 LLM_PROVIDER_METADATA: Mapping[str, LLMProviderMetadata] = MappingProxyType(

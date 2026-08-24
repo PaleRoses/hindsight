@@ -17,6 +17,20 @@ _MISSION_PRIORITY_NOTE = (
     "DECISION GUIDE, or OUTPUT FORMAT below, the MISSION takes priority."
 )
 
+# Default language rule — used only when HINDSIGHT_API_LLM_OUTPUT_LANGUAGE is
+# unset. Without it the whole prompt is English and multilingual models drift:
+# Chinese source facts intermittently produce English observations. Retain's
+# fact extraction carries the equivalent rule (see _BASE_FACT_EXTRACTION_PROMPT),
+# so this makes "preserve the source language" the pipeline-wide default. When an
+# output language IS configured, this section is omitted and
+# output_language_directive() takes over — the two must never both be present or
+# they contradict each other.
+_DEFAULT_LANGUAGE_RULE = """## LANGUAGE
+
+Write every observation in the language of its own source facts — never translate them. Per observation, not per batch: when one merges facts of several languages, the majority wins. Proper nouns, identifiers, and units stay verbatim.
+
+When an existing observation is written in a different language from the new facts updating it, do NOT edit its wording in place — that is what produces an English sentence with a Chinese detail bolted on. Discard the old phrasing and compose the merged observation from scratch in the new facts' language."""
+
 _PROCESSING_RULES = """## PROCESSING RULES
 
 1. PREFER UPDATE OVER CREATE (when there is something to merge with): if new facts describe the same canonical event, statement, decision, claim, or recurring pattern already covered by an existing observation, UPDATE that observation and attach the new facts as evidence. Do NOT create a near-duplicate sibling. One canonical observation with many source facts is always better than many siblings with one source fact each. Merge aggressively on: same named event, same diagnostic finding, same architectural decision, same recurring claim. **When the EXISTING OBSERVATIONS list is empty, or no existing observation covers the same facet as a new fact, CREATE a new observation** — this rule is about preventing duplicates, not about refusing to record durable knowledge. CREATE is the correct default for any structurally distinct event, claim, or pattern that has no existing match.
@@ -37,10 +51,8 @@ _PROCESSING_RULES = """## PROCESSING RULES
 
 9. KEEP DISTINCT TOPICS DISTINCT: do not merge observations about different people, entities, or unrelated topics. Merging is for the same canonical fact recurring — not for related-but-distinct claims."""
 
-# Field-by-field definitions of the input shape, shared by the cached system
-# prefix (_INPUT_FORMAT_NOTE) and the single-message prompt (_INPUT_SECTION) so
-# the two descriptions cannot drift apart. Both call sites run .format(), so
-# these strings must contain no braces.
+# Field-by-field definitions of the input shape used by the cached system
+# prefix. The call site runs .format(), so these strings must contain no braces.
 _FACT_FIELDS = """One per line, formatted as `[uuid] fact text (temporal fields)`:
 - `[uuid]`: the fact's identifier — copy it verbatim into `source_fact_ids`
 - `occurred_start` / `occurred_end`: when the described event happened. This can be long before the fact was stated — a fact recorded today may describe a 2019 event.
@@ -82,24 +94,6 @@ _SPLIT_INPUT_SECTION = """## INPUT
 ### Existing observations
 
 {observations_text}"""
-
-# Data section — format placeholders {facts_text} and {observations_text} are substituted at call time
-_INPUT_SECTION = f"""## INPUT
-
-Every temporal field below is optional and is omitted when unknown.
-
-### New facts
-
-{_FACT_FIELDS}
-
-{{facts_text}}
-
-### Existing observations
-
-JSON array, pooled from recalls across all new facts above. Each entry has:
-{_OBSERVATION_FIELDS}
-
-{{observations_text}}"""
 
 _DECISION_GUIDE = """## DECISION GUIDE
 
@@ -161,39 +155,6 @@ Expected output (UPDATE for the state change; CREATE for the unrelated work-hour
 - Return `{{"creates": [], "updates": [], "deletes": []}}` if nothing durable is found."""
 
 
-def build_batch_consolidation_prompt(
-    observations_mission: str | None = None,
-    observation_capacity_note: str | None = None,
-    llm_output_language: str | None = None,
-) -> str:
-    """
-    Build the consolidation prompt for batch mode (multiple facts per LLM call).
-
-    The mission defines *what* to track (customisable per bank) and takes
-    priority over the built-in processing rules when the two conflict.
-    Processing rules, decision guide, and output format are always present.
-    When ``llm_output_language`` is set, observations are emitted in that
-    language.
-    """
-    mission = escape_for_prompt(observations_mission or _DEFAULT_MISSION)
-
-    capacity_section = ""
-    if observation_capacity_note:
-        capacity_section = f"\n\n## CAPACITY CONSTRAINT\n\n{escape_for_prompt(observation_capacity_note)}"
-
-    return (
-        "You are a memory consolidation system. Synthesize new facts into "
-        "observations, merging with existing observations when appropriate.\n\n"
-        f"## MISSION\n\n{mission}\n\n"
-        f"{_MISSION_PRIORITY_NOTE}"
-        f"{capacity_section}\n\n"
-        f"{_PROCESSING_RULES}\n\n"
-        f"{_INPUT_SECTION}\n\n"
-        f"{_DECISION_GUIDE}\n\n"
-        f"{_OUTPUT_SECTION}" + output_language_directive(llm_output_language)
-    )
-
-
 def build_consolidation_system_prompt(
     llm_output_language: str | None = None,
 ) -> str:
@@ -208,11 +169,17 @@ def build_consolidation_system_prompt(
     bank and a single CachedContent serves them all. Returns final text
     (brace-escaped examples already unescaped) for verbatim use as system message
     and cached prefix.
+
+    ``llm_output_language`` picks between two mutually exclusive language rules:
+    unset keeps each observation in the language of its own source facts (the
+    default), set forces every observation into that one configured language.
     """
+    language_section = "" if llm_output_language else f"{_DEFAULT_LANGUAGE_RULE}\n\n"
     template = (
         "You are a memory consolidation system. Synthesize new facts into "
         "observations, merging with existing observations when appropriate.\n\n"
         f"{_MISSION_PRIORITY_NOTE}\n\n"
+        f"{language_section}"
         f"{_PROCESSING_RULES}\n\n"
         f"{_INPUT_FORMAT_NOTE}\n\n"
         f"{_DECISION_GUIDE}\n\n"

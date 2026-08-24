@@ -34,6 +34,26 @@ def mock_llm_config():
     mock.provider = "openai"
     mock.model = "gpt-4o-mini"
     mock._provider_impl = AsyncMock()
+    # The serving impl is what the request body and the crash-recovery guard read,
+    # so it carries real values rather than auto-created mock attributes.
+    mock._provider_impl.provider = "openai"
+    mock._provider_impl.model = "gpt-4o-mini"
+    mock._provider_impl.openai_service_tier = None
+    mock._provider_impl.batch_account_key = "openai|https://api.openai.com/v1|000000000000"
+
+    # The batch path resolves its serving impl via ``batch_provider_impl()`` (a
+    # multi-LLM chain returns the first batch-capable member); for a single mock
+    # provider that is ``_provider_impl`` itself — or None when the test declares
+    # the provider batch-incapable, or when a resume names a different account,
+    # mirroring LLMProvider.batch_provider_impl.
+    async def _batch_provider_impl(account_key: str | None = None):
+        if not await mock._provider_impl.supports_batch_api():
+            return None
+        if account_key is not None and mock._provider_impl.batch_account_key != account_key:
+            return None
+        return mock._provider_impl
+
+    mock.batch_provider_impl = _batch_provider_impl
     return mock
 
 
