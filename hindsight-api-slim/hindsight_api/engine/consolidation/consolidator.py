@@ -18,7 +18,9 @@ NOTE: Observations are distinct from mental models (pinned reflections).
 import asyncio
 import json
 import logging
+import re
 import time
+import unicodedata
 import uuid
 from collections import defaultdict
 from contextlib import AsyncExitStack
@@ -26,13 +28,14 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
 from fnmatch import fnmatchcase
-from itertools import combinations
+from functools import lru_cache
+from itertools import chain, combinations
 from typing import TYPE_CHECKING, Any, Literal
 
 import asyncpg
 from pydantic import BaseModel, ValidationError, field_validator
 
-from ...config import get_config
+from ...config import ConsolidationProtectedVocabulary, get_config
 from ...worker.stage import set_stage
 from ..db import DatabaseBackend
 from ..db_utils import acquire_with_retry
@@ -130,6 +133,81 @@ def _norm_obs_text(text: str) -> str:
     which *does* lose information, so we match case-sensitively.
     """
     return " ".join((text or "").split()).strip()
+
+
+@dataclass(frozen=True)
+class _ProtectedTerm:
+    value: str
+    pattern: re.Pattern[str]
+
+
+@dataclass(frozen=True)
+class _ProtectedVocabulary:
+    name: str
+    terms: tuple[_ProtectedTerm, ...]
+
+
+@dataclass(frozen=True)
+class _ProtectedVocabularyConflict:
+    vocabulary: str
+    source_terms: tuple[str, ...]
+    target_terms: tuple[str, ...]
+
+
+@lru_cache(maxsize=128)
+def _compile_protected_vocabularies(
+    vocabularies: tuple[ConsolidationProtectedVocabulary, ...],
+) -> tuple[_ProtectedVocabulary, ...]:
+    """Compile each validated bank vocabulary once."""
+
+    def compile_term(term: str) -> _ProtectedTerm:
+        body = r"\s+".join(re.escape(part) for part in term.split())
+        return _ProtectedTerm(value=term, pattern=re.compile(body))
+
+    return tuple(
+        _ProtectedVocabulary(
+            name=vocabulary.name,
+            terms=tuple(compile_term(term) for term in vocabulary.terms),
+        )
+        for vocabulary in vocabularies
+    )
+
+
+def _protected_vocabulary_conflicts(
+    source_text: str,
+    target_text: str,
+    vocabularies: tuple[_ProtectedVocabulary, ...],
+) -> tuple[_ProtectedVocabularyConflict, ...]:
+    """Return known-versus-known disjoint protected terms; unknown terms remain permissive."""
+
+    def is_identifier_char(character: str) -> bool:
+        category = unicodedata.category(character)
+        return character == "-" or category[0] in {"L", "M", "N"} or category == "Pc"
+
+    def has_term(text: str, term: _ProtectedTerm) -> bool:
+        return any(
+            (match.start() == 0 or not is_identifier_char(text[match.start() - 1]))
+            and (match.end() == len(text) or not is_identifier_char(text[match.end()]))
+            for match in term.pattern.finditer(text)
+        )
+
+    def matched_terms(text: str, vocabulary: _ProtectedVocabulary) -> frozenset[str]:
+        folded = unicodedata.normalize("NFKC", text).casefold()
+        return frozenset(term.value for term in vocabulary.terms if has_term(folded, term))
+
+    conflicts: list[_ProtectedVocabularyConflict] = []
+    for vocabulary in vocabularies:
+        source_terms = matched_terms(source_text, vocabulary)
+        target_terms = matched_terms(target_text, vocabulary)
+        if source_terms and target_terms and source_terms.isdisjoint(target_terms):
+            conflicts.append(
+                _ProtectedVocabularyConflict(
+                    vocabulary=vocabulary.name,
+                    source_terms=tuple(sorted(source_terms)),
+                    target_terms=tuple(sorted(target_terms)),
+                )
+            )
+    return tuple(conflicts)
 
 
 def _duplicate_create_target(
@@ -296,6 +374,8 @@ async def _dedup_adjudicate(
     anchor_emb_str: str | None,
     tags: list[str] | None,
     exclude_id: str | None,
+    protected_vocabularies: tuple[_ProtectedVocabulary, ...] = (),
+    protected_evidence: tuple[str, ...] = (),
 ) -> _DedupOutcome:
     """Probe one observation's embedding against in-scope observations and adjudicate a merge.
 
@@ -341,6 +421,21 @@ async def _dedup_adjudicate(
         rid = str(r.id)
         if exclude_id is not None and rid == exclude_id:
             continue  # never match the anchor observation against itself
+        conflicts = tuple(
+            conflict
+            for evidence_text in (anchor_text, *protected_evidence)
+            for conflict in _protected_vocabulary_conflicts(evidence_text, r.text, protected_vocabularies)
+        )
+        if conflicts:
+            logger.warning(
+                "[CONSOLIDATION] dedup rejected protected-vocabulary candidate %s: %s",
+                rid,
+                ", ".join(
+                    f"{conflict.vocabulary}:{'/'.join(conflict.source_terms)}!={'/'.join(conflict.target_terms)}"
+                    for conflict in conflicts
+                ),
+            )
+            continue
         sim = r.similarity or 0.0
         if sim >= best_sim:
             best_id, best_text, best_sim = rid, r.text, sim
@@ -360,6 +455,17 @@ async def _dedup_adjudicate(
     if decision.action != "merge":
         return _DedupOutcome(best_id=best_id, merged_text="", should_merge=False, best_text=best_text)
     merged_text = (sanitize_llm_output(decision.text) or "").strip() or best_text
+    merge_conflicts = tuple(
+        conflict
+        for evidence_text in (anchor_text, best_text, *protected_evidence)
+        for conflict in _protected_vocabulary_conflicts(evidence_text, merged_text, protected_vocabularies)
+    )
+    if merge_conflicts:
+        logger.warning(
+            "[CONSOLIDATION] dedup rejected protected-vocabulary merged text for candidate %s",
+            best_id,
+        )
+        return _DedupOutcome(best_id=best_id, merged_text="", should_merge=False, best_text=best_text)
     return _DedupOutcome(best_id=best_id, merged_text=merged_text, should_merge=True, best_text=best_text)
 
 
@@ -373,6 +479,8 @@ async def _dedup_reconcile_create(
     create_source_ids: list[uuid.UUID],
     tags: list[str] | None,
     source_bounds: _TemporalBounds,
+    protected_vocabularies: tuple[_ProtectedVocabulary, ...] = (),
+    source_protected_texts: tuple[str, ...] = (),
     txn=None,
 ) -> str | None:
     """Semantic dedup for a single CREATE (create-time, focused 1-by-1).
@@ -389,7 +497,17 @@ async def _dedup_reconcile_create(
     short-lived connection and re-checks source liveness inside the fold transaction.
     """
     outcome = await _dedup_adjudicate(
-        pool, memory_engine, bank_id, config, dedup_llm_config, create_text, None, tags, exclude_id=None
+        pool,
+        memory_engine,
+        bank_id,
+        config,
+        dedup_llm_config,
+        create_text,
+        None,
+        tags,
+        exclude_id=None,
+        protected_vocabularies=protected_vocabularies,
+        protected_evidence=source_protected_texts,
     )
     if not outcome.should_merge or outcome.best_id is None:
         return None
@@ -468,6 +586,8 @@ async def _dedup_reconcile_update(
     updated_text: str,
     updated_emb_str: str | None,
     tags: list[str] | None,
+    protected_vocabularies: tuple[_ProtectedVocabulary, ...] = (),
+    protected_evidence: tuple[str, ...] = (),
     txn=None,
 ) -> None:
     """Semantic dedup for an UPDATE (after the observation was rewritten + re-embedded).
@@ -490,6 +610,8 @@ async def _dedup_reconcile_update(
         updated_emb_str,
         tags,
         exclude_id=updated_id,
+        protected_vocabularies=protected_vocabularies,
+        protected_evidence=protected_evidence,
     )
     if not outcome.should_merge or outcome.best_id is None:
         return
@@ -814,6 +936,99 @@ class _BatchLLMResult:
     obs_count: int = 0
     prompt_chars: int = 0
     failed: bool = False
+
+
+@dataclass(frozen=True)
+class _ProtectedVocabularyViolation:
+    action: Literal["create", "update"]
+    observation_id: str | None
+    source_fact_id: str
+    conflicts: tuple[_ProtectedVocabularyConflict, ...]
+
+
+def _find_protected_vocabulary_violations(
+    result: _BatchLLMResult,
+    memories: list[dict[str, Any]],
+    observations: "list[MemoryFact]",
+    vocabularies: tuple[_ProtectedVocabulary, ...],
+) -> tuple[_ProtectedVocabularyViolation, ...]:
+    """Inspect source, target, and proposed texts at the model-output boundary."""
+    if not vocabularies:
+        return ()
+
+    memories_by_id = {str(memory["id"]): memory for memory in memories}
+    observations_by_id = {str(observation.id): observation for observation in observations}
+    violations: list[_ProtectedVocabularyViolation] = []
+
+    def inspect_sources(
+        *,
+        action: Literal["create", "update"],
+        source_fact_ids: list[str],
+        target_text: str,
+        observation_id: str | None,
+    ) -> None:
+        for source_fact_id in dict.fromkeys(source_fact_ids):
+            source = memories_by_id.get(source_fact_id)
+            if source is None:
+                continue
+            conflicts = _protected_vocabulary_conflicts(str(source.get("text") or ""), target_text, vocabularies)
+            if conflicts:
+                violations.append(
+                    _ProtectedVocabularyViolation(
+                        action=action,
+                        observation_id=observation_id,
+                        source_fact_id=source_fact_id,
+                        conflicts=conflicts,
+                    )
+                )
+
+    for create in result.creates:
+        inspect_sources(
+            action="create",
+            source_fact_ids=create.source_fact_ids,
+            target_text=create.text,
+            observation_id=None,
+        )
+
+    for update in result.updates:
+        target = observations_by_id.get(update.observation_id)
+        if target is None:
+            continue
+        inspect_sources(
+            action="update",
+            source_fact_ids=update.source_fact_ids,
+            target_text=target.text,
+            observation_id=update.observation_id,
+        )
+        inspect_sources(
+            action="update",
+            source_fact_ids=update.source_fact_ids,
+            target_text=update.text,
+            observation_id=update.observation_id,
+        )
+        conflicts = _protected_vocabulary_conflicts(update.text, target.text, vocabularies)
+        if conflicts:
+            violations.append(
+                _ProtectedVocabularyViolation(
+                    action="update",
+                    observation_id=update.observation_id,
+                    source_fact_id=next(iter(update.source_fact_ids), "<update-text>"),
+                    conflicts=conflicts,
+                )
+            )
+    return tuple(violations)
+
+
+def _format_protected_vocabulary_violations(violations: tuple[_ProtectedVocabularyViolation, ...]) -> str:
+    return "; ".join(
+        f"action={violation.action} observation={violation.observation_id or '-'} "
+        f"source={violation.source_fact_id} "
+        + ", ".join(
+            f"{conflict.vocabulary}:{'/'.join(conflict.source_terms)}!={'/'.join(conflict.target_terms)}"
+            for conflict in violation.conflicts
+        )
+        for violation in violations
+    )
 
 
 @dataclass
@@ -2174,9 +2389,12 @@ async def _process_memory_batch(
                 f"({current_count}/{max_obs}), only updates/deletes allowed"
             )
 
-    # 3. Single LLM call
+    # 3. Single guarded LLM call
+    protected_vocabularies = _compile_protected_vocabularies(
+        tuple(getattr(config, "consolidation_protected_vocabularies", ()))
+    )
     t0 = time.time()
-    llm_result = await _consolidate_batch_with_llm(
+    llm_result = await _consolidate_batch_with_protected_vocabularies(
         llm_config=llm_config,
         memories=memories,
         union_observations=union_observations,
@@ -2184,10 +2402,11 @@ async def _process_memory_batch(
         config=config,
         remaining_observation_slots=remaining_observation_slots,
         max_observations_per_scope=max_obs,
+        protected_vocabularies=protected_vocabularies,
+        perf=perf,
     )
     if perf:
         perf.record_timing("llm", time.time() - t0)
-        perf.record_llm_call(llm_result.obs_count, llm_result.prompt_chars)
 
     # 4. Sequential execution of deletes / updates / creates
     # Deletes run first to free observation slots before creates consume them.
@@ -2268,6 +2487,8 @@ async def _process_memory_batch(
                 update.text,
                 updated_emb_str,
                 agg.tags,
+                protected_vocabularies=protected_vocabularies,
+                protected_evidence=tuple(str(memory.get("text") or "") for memory in source_mems),
                 txn=txn,
             )
 
@@ -2317,6 +2538,8 @@ async def _process_memory_batch(
                 create_source_ids,
                 agg.tags,
                 _TemporalBounds.of(agg),
+                protected_vocabularies=protected_vocabularies,
+                source_protected_texts=tuple(str(memory.get("text") or "") for memory in source_mems),
                 txn=txn,
             )
             if merged_into is not None:
@@ -3113,6 +3336,127 @@ async def _consolidate_batch_with_llm(
     return _BatchLLMResult(
         obs_count=len(union_observations), prompt_chars=len(system_prompt) + len(user_content), failed=True
     )
+
+
+async def _consolidate_batch_with_protected_vocabularies(
+    *,
+    llm_config: Any,
+    memories: list[dict[str, Any]],
+    union_observations: "list[MemoryFact]",
+    union_source_facts: "dict[str, MemoryFact]",
+    config: Any,
+    remaining_observation_slots: int | None,
+    max_observations_per_scope: int,
+    protected_vocabularies: tuple[_ProtectedVocabulary, ...],
+    perf: ConsolidationPerfLog | None,
+) -> _BatchLLMResult:
+    """Retry model output without protected-vocabulary-conflicting targets, then fail closed."""
+    if not protected_vocabularies:
+        result = await _consolidate_batch_with_llm(
+            llm_config=llm_config,
+            memories=memories,
+            union_observations=union_observations,
+            union_source_facts=union_source_facts,
+            config=config,
+            remaining_observation_slots=remaining_observation_slots,
+            max_observations_per_scope=max_observations_per_scope,
+        )
+        if perf:
+            perf.record_llm_call(result.obs_count, result.prompt_chars)
+        return result
+
+    available_observations = list(union_observations)
+    rejected_observation_ids: set[str] = set()
+    displaced_source_ids: set[str] = set()
+    memory_ids = {str(memory["id"]) for memory in memories}
+    max_attempts = max(1, config.consolidation_max_attempts)
+    for attempt in range(1, max_attempts + 1):
+        result = await _consolidate_batch_with_llm(
+            llm_config=llm_config,
+            memories=memories,
+            union_observations=available_observations,
+            union_source_facts=union_source_facts,
+            config=config,
+            remaining_observation_slots=remaining_observation_slots,
+            max_observations_per_scope=max_observations_per_scope,
+            max_attempts_override=1,
+        )
+        if perf:
+            perf.record_llm_call(result.obs_count, result.prompt_chars)
+        if result.failed:
+            if attempt == max_attempts:
+                return result
+            continue
+
+        violations = _find_protected_vocabulary_violations(
+            result,
+            memories,
+            union_observations,
+            protected_vocabularies,
+        )
+        accounted_source_ids = {
+            source_id for action in chain(result.creates, result.updates) for source_id in action.source_fact_ids
+        }
+        unaccounted_source_ids = displaced_source_ids - accounted_source_ids
+        referenced_rejected_ids = rejected_observation_ids.intersection(
+            {action.observation_id for action in chain(result.updates, result.deletes)}
+        )
+        if not violations and not unaccounted_source_ids and not referenced_rejected_ids:
+            return result
+
+        if violations:
+            logger.warning(
+                "[CONSOLIDATION] rejected protected-vocabulary-conflicting model output (attempt %d/%d): %s",
+                attempt,
+                max_attempts,
+                _format_protected_vocabulary_violations(violations),
+            )
+            newly_rejected_ids = {
+                violation.observation_id for violation in violations if violation.observation_id is not None
+            }
+            rejected_observation_ids.update(newly_rejected_ids)
+            violating_update_ids = {
+                violation.observation_id for violation in violations if violation.action == "update"
+            }
+            displaced_source_ids.update(
+                source_id
+                for update in result.updates
+                if update.observation_id in violating_update_ids
+                for source_id in update.source_fact_ids
+                if source_id in memory_ids
+            )
+            displaced_source_ids.update(
+                violation.source_fact_id
+                for violation in violations
+                if violation.action == "create" and violation.source_fact_id in memory_ids
+            )
+            available_observations = [
+                observation
+                for observation in available_observations
+                if str(observation.id) not in rejected_observation_ids
+            ]
+        else:
+            logger.warning(
+                "[CONSOLIDATION] retry did not preserve protected-vocabulary constraints "
+                "(attempt %d/%d): missing_sources=%s rejected_targets=%s",
+                attempt,
+                max_attempts,
+                sorted(unaccounted_source_ids),
+                sorted(referenced_rejected_ids),
+            )
+
+        if attempt == max_attempts:
+            logger.error(
+                "[CONSOLIDATION] protected-vocabulary guard exhausted after %d attempts; failing batch",
+                max_attempts,
+            )
+            return _BatchLLMResult(
+                obs_count=result.obs_count,
+                prompt_chars=result.prompt_chars,
+                failed=True,
+            )
+
+    return _BatchLLMResult(failed=True)
 
 
 async def _create_observation_directly(

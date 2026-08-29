@@ -38,6 +38,10 @@ NEW_FIELDS: list[tuple[str, object]] = [
     ("consolidation_llm_batch_size", 11),
     ("consolidation_source_facts_max_tokens", 2048),
     ("consolidation_source_facts_max_tokens_per_observation", 256),
+    (
+        "consolidation_protected_vocabularies",
+        [{"name": "environment", "terms": ["staging", "production"]}],
+    ),
     ("max_observations_per_scope", 13),
     ("reflect_source_facts_max_tokens", 4096),
     ("mental_model_min_refresh_interval_seconds", 900),

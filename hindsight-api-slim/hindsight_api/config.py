@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import sys
+import unicodedata
 from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -679,6 +680,7 @@ ENV_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS_PER_OBSERVATION = (
 )
 ENV_CONSOLIDATION_RECALL_BUDGET = "HINDSIGHT_API_CONSOLIDATION_RECALL_BUDGET"
 ENV_CONSOLIDATION_MAX_ATTEMPTS = "HINDSIGHT_API_CONSOLIDATION_MAX_ATTEMPTS"
+ENV_CONSOLIDATION_PROTECTED_VOCABULARIES = "HINDSIGHT_API_CONSOLIDATION_PROTECTED_VOCABULARIES"
 ENV_OBSERVATIONS_MISSION = "HINDSIGHT_API_OBSERVATIONS_MISSION"
 ENV_MAX_OBSERVATIONS_PER_SCOPE = "HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE"
 ENV_OBSERVATION_SCOPE_LIMITS = "HINDSIGHT_API_OBSERVATION_SCOPE_LIMITS"
@@ -1290,6 +1292,52 @@ DEFAULT_STORE_DOCUMENT_TEXT = True  # Persist raw source text in documents.origi
 DEFAULT_ENABLE_DOCUMENT_EXPORT_API = True
 DEFAULT_ENABLE_DOCUMENT_IMPORT_API = True
 
+
+@dataclass(frozen=True)
+class ConsolidationProtectedVocabulary:
+    """One closed vocabulary whose terms are mutually exclusive during consolidation."""
+
+    name: str
+    terms: tuple[str, ...]
+
+
+def parse_consolidation_protected_vocabularies(
+    value: Any,
+) -> tuple[ConsolidationProtectedVocabulary, ...]:
+    """Validate and canonicalize protected consolidation vocabularies."""
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("consolidation_protected_vocabularies must be a list")
+
+    def parse_vocabulary(raw: Any, index: int) -> ConsolidationProtectedVocabulary:
+        if isinstance(raw, ConsolidationProtectedVocabulary):
+            raw = {"name": raw.name, "terms": raw.terms}
+        if not isinstance(raw, dict) or set(raw) != {"name", "terms"}:
+            raise ValueError(f"consolidation_protected_vocabularies[{index}] must contain exactly 'name' and 'terms'")
+        name = raw["name"]
+        terms = raw["terms"]
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"consolidation_protected_vocabularies[{index}].name must be a non-empty string")
+        canonical_name = " ".join(unicodedata.normalize("NFKC", name).split())
+        if not isinstance(terms, (list, tuple)):
+            raise ValueError(f"consolidation_protected_vocabularies[{index}].terms must be a list")
+        if not all(isinstance(term, str) and term.strip() for term in terms):
+            raise ValueError(f"consolidation_protected_vocabularies[{index}].terms must contain only non-empty strings")
+        canonical_terms = tuple(" ".join(unicodedata.normalize("NFKC", term).split()).casefold() for term in terms)
+        if len(canonical_terms) < 2:
+            raise ValueError(f"consolidation_protected_vocabularies[{index}] must define at least two terms")
+        if len(set(canonical_terms)) != len(canonical_terms):
+            raise ValueError(f"consolidation_protected_vocabularies[{index}].terms contains duplicates")
+        return ConsolidationProtectedVocabulary(name=canonical_name, terms=canonical_terms)
+
+    vocabularies = tuple(parse_vocabulary(raw, index) for index, raw in enumerate(value))
+    names = tuple(vocabulary.name.casefold() for vocabulary in vocabularies)
+    if len(set(names)) != len(names):
+        raise ValueError("consolidation_protected_vocabularies contains duplicate vocabulary names")
+    return vocabularies
+
+
 # Observations defaults (consolidated knowledge from facts)
 DEFAULT_ENABLE_OBSERVATIONS = True  # Observations enabled by default
 DEFAULT_ENABLE_AUTO_CONSOLIDATION = True  # Auto-consolidation after retain enabled by default
@@ -1332,6 +1380,7 @@ DEFAULT_CONSOLIDATION_MAX_TOKENS = 512  # Max tokens for recall when finding rel
 # budget — 100% backwards compatible. Operators on providers with a low hidden default (notably Bedrock imported
 # models, which cap at 4096 and truncate structured consolidation JSON) set this explicitly to fix #1939.
 DEFAULT_CONSOLIDATION_MAX_COMPLETION_TOKENS = None
+DEFAULT_CONSOLIDATION_PROTECTED_VOCABULARIES: tuple[ConsolidationProtectedVocabulary, ...] = ()
 DEFAULT_CONSOLIDATION_RECALL_BUDGET = "low"  # Budget level for consolidation recall (low/mid/high)
 DEFAULT_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS = (
     4096  # Total token budget for source facts in consolidation recall (-1 = unlimited)
@@ -2640,6 +2689,9 @@ class HindsightConfig:
     consolidation_source_facts_max_tokens: int
     consolidation_source_facts_max_tokens_per_observation: int
     consolidation_max_attempts: int
+    # Closed vocabularies whose distinct terms must never be synthesized into one observation.
+    # Raw JSON shape: [{"name": "environment", "terms": ["staging", "production"]}, ...]
+    consolidation_protected_vocabularies: tuple[ConsolidationProtectedVocabulary, ...]
     observations_mission: str | None
     max_observations_per_scope: int
     # Per-scope observation caps overriding max_observations_per_scope.
@@ -2943,6 +2995,7 @@ class HindsightConfig:
         "consolidation_max_memories_per_round",
         "consolidation_source_facts_max_tokens",
         "consolidation_source_facts_max_tokens_per_observation",
+        "consolidation_protected_vocabularies",
         "observations_mission",
         "max_observations_per_scope",
         "observation_scope_limits",
@@ -3995,6 +4048,9 @@ class HindsightConfig:
             ),
             consolidation_max_attempts=int(
                 os.getenv(ENV_CONSOLIDATION_MAX_ATTEMPTS, str(DEFAULT_CONSOLIDATION_MAX_ATTEMPTS))
+            ),
+            consolidation_protected_vocabularies=parse_consolidation_protected_vocabularies(
+                json.loads(os.getenv(ENV_CONSOLIDATION_PROTECTED_VOCABULARIES, "null"))
             ),
             observations_mission=os.getenv(ENV_OBSERVATIONS_MISSION) or DEFAULT_OBSERVATIONS_MISSION,
             max_observations_per_scope=int(

@@ -2768,6 +2768,13 @@ class BankTemplateConfig(BaseModel):
     consolidation_source_facts_max_tokens_per_observation: int | None = Field(
         default=None, description="Max tokens of source facts per observation"
     )
+    consolidation_protected_vocabularies: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "Closed vocabularies whose terms are mutually exclusive during consolidation: "
+            '[{"name": "environment", "terms": ["staging", "production"]}]'
+        ),
+    )
     max_observations_per_scope: int | None = Field(
         default=None, description="Max observations to retain per consolidation scope"
     )

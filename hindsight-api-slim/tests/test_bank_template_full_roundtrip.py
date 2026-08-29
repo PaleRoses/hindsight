@@ -50,7 +50,6 @@ from hindsight_api.api import create_app
 from hindsight_api.api.http import BankTemplateConfig
 from hindsight_api.config import HindsightConfig
 
-
 # One value per BankTemplateConfig field, each chosen to differ visibly from the
 # server default so a value that silently reverts is caught rather than matching
 # by luck. Cross-field constraints enforced by validate_bank_template() and the
@@ -97,6 +96,7 @@ _SAMPLE_VALUES: dict[str, Any] = {
     "consolidation_source_facts_max_tokens_per_observation": 256,
     "max_observations_per_scope": 13,
     "observation_scope_limits": [{"scope": ["run_*"], "limit": 2}],
+    "consolidation_protected_vocabularies": [{"name": "environment", "terms": ["staging", "production"]}],
     "reflect_source_facts_max_tokens": 4096,
     "mental_model_min_refresh_interval_seconds": 900,
     "llm_gemini_safety_settings": [{"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"}],

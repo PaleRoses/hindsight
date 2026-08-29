@@ -21,6 +21,7 @@ from hindsight_api.config import (
     HindsightConfig,
     _get_raw_config,
     normalize_config_dict,
+    parse_consolidation_protected_vocabularies,
     validate_retain_chunking_config,
     validate_retain_completion_token_budget,
 )
@@ -212,6 +213,9 @@ class ConfigResolver:
         # config so the resolved object stays well-typed for any consumer that reads them.
         resolved_config = replace(
             resolved_config,
+            consolidation_protected_vocabularies=parse_consolidation_protected_vocabularies(
+                resolved_config.consolidation_protected_vocabularies
+            ),
             reranker_members=self._global_config.reranker_members,
             llm_members=self._global_config.llm_members,
             llm_strategy=self._global_config.llm_strategy,
@@ -501,6 +505,20 @@ class ConfigResolver:
             except Exception as e:
                 raise ValueError(f"Invalid entity_labels format: {e}")
 
+        if (
+            "consolidation_protected_vocabularies" in normalized_updates
+            and normalized_updates["consolidation_protected_vocabularies"] is not None
+        ):
+            try:
+                vocabularies = parse_consolidation_protected_vocabularies(
+                    normalized_updates["consolidation_protected_vocabularies"]
+                )
+            except ValueError as e:
+                raise ValueError(f"Invalid consolidation_protected_vocabularies format: {e}") from e
+            normalized_updates["consolidation_protected_vocabularies"] = [
+                {"name": vocabulary.name, "terms": list(vocabulary.terms)} for vocabulary in vocabularies
+            ]
+
         # Validate retain_strategies: reject empty string keys
         if "retain_strategies" in normalized_updates and normalized_updates["retain_strategies"]:
             empty_keys = [k for k in normalized_updates["retain_strategies"] if not str(k).strip()]
@@ -643,6 +661,8 @@ _WIDENED_FIELD_TYPES: dict[str, tuple[type, ...]] = {
     # parse_entity_labels() accepts both the bare list of label groups and the
     # {"attributes": [...]} envelope, though the field is annotated `list | None`.
     "entity_labels": (list, dict),
+    # The API persists this immutable tuple as a JSON list, then canonicalizes on resolution.
+    "consolidation_protected_vocabularies": (tuple, list),
 }
 
 
