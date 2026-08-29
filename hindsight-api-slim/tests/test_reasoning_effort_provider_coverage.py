@@ -11,8 +11,8 @@ Two outcomes are acceptable, and nothing else:
     it per target provider (Anthropic thinking budgets, Gemini thinking config, OpenAI's
     flat parameter). `litellm.drop_params = True` discards it for models with no
     reasoning knob rather than raising.
-  * **reported** — providers with no reasoning control at all (Gemini and Anthropic
-    native SDKs, Claude Code) log a WARNING at startup naming the ignored value.
+  * **reported** — providers with no reasoning control at all (Gemini and Claude Code)
+    log a WARNING at startup naming the ignored value.
 """
 
 import logging
@@ -74,19 +74,6 @@ class TestProvidersWithoutReasoningControlSaySo:
 
         with caplog.at_level(logging.WARNING):
             GeminiLLM(provider="gemini", api_key="k", base_url="", model="gemini-2.5-flash", reasoning_effort="high")
-        assert any("reasoning_effort" in r.message and "ignored" in r.message for r in caplog.records)
-
-    def test_anthropic_warns(self, caplog):
-        from hindsight_api.engine.providers.anthropic_llm import AnthropicLLM
-
-        with caplog.at_level(logging.WARNING):
-            AnthropicLLM(
-                provider="anthropic",
-                api_key="k",
-                base_url="",
-                model="claude-sonnet-4-20250514",
-                reasoning_effort="high",
-            )
         assert any("reasoning_effort" in r.message and "ignored" in r.message for r in caplog.records)
 
     def test_nothing_is_logged_when_nothing_was_configured(self, caplog):

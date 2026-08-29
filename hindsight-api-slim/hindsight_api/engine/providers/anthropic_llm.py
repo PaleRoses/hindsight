@@ -39,6 +39,15 @@ def _usage_from_anthropic_response(response: Any) -> LLMResponseUsage:
 
 _EPHEMERAL_CACHE = {"type": "ephemeral"}
 
+_ANTHROPIC_THINKING_BUDGETS = {
+    "none": 0,
+    "low": 4096,
+    "medium": 8192,
+    "high": 16384,
+    "xhigh": 32768,
+    "max": 32768,
+}
+
 
 def _cached_system_blocks(system_prompt: str) -> list[dict[str, Any]]:
     """Render the system prompt as a block list with a cache_control marker.
@@ -102,7 +111,7 @@ class AnthropicLLM(LLMInterface):
             api_key: Anthropic API key.
             base_url: Base URL for the API (optional, uses Anthropic default if empty).
             model: Model name (e.g., "claude-sonnet-4-20250514").
-            reasoning_effort: Reasoning effort level (not used by Anthropic).
+            reasoning_effort: Effort level mapped to an Anthropic extended-thinking token budget.
             timeout: Request timeout in seconds.
             default_headers: Optional custom headers passed as ``default_headers`` to
                 the Anthropic SDK client. Used by operators routing through proxies
@@ -115,7 +124,16 @@ class AnthropicLLM(LLMInterface):
             **kwargs: Additional provider-specific parameters.
         """
         super().__init__(provider, api_key, base_url, model, reasoning_effort, **kwargs)
-        self._warn_reasoning_effort_unsupported()
+
+        effort = (self.reasoning_effort or "").strip().lower()
+        self._thinking_budget = _ANTHROPIC_THINKING_BUDGETS.get(effort, 0)
+        if effort and effort not in _ANTHROPIC_THINKING_BUDGETS:
+            logger.warning(
+                "reasoning_effort=%r is ignored by the Anthropic provider; "
+                "use one of: %s",
+                self.reasoning_effort,
+                ", ".join(_ANTHROPIC_THINKING_BUDGETS),
+            )
 
         if not self.api_key:
             raise ValueError("API key is required for Anthropic provider")
@@ -259,6 +277,12 @@ class AnthropicLLM(LLMInterface):
                 {"name": _tool_name, "description": "Return the structured response.", "input_schema": schema}
             ]
             call_params["tool_choice"] = {"type": "tool", "name": _tool_name}
+
+        # Anthropic's thinking budget is part of max_tokens. Forced tool choice
+        # rejects extended thinking, and the verification ping should stay minimal.
+        if self._thinking_budget and not use_forced_tool and scope != "verification":
+            call_params["thinking"] = {"type": "enabled", "budget_tokens": self._thinking_budget}
+            call_params["max_tokens"] += self._thinking_budget
 
         if self._extra_body:
             call_params["extra_body"] = self._extra_body
