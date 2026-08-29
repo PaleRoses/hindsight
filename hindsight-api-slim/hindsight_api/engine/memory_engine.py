@@ -510,10 +510,11 @@ if TYPE_CHECKING:
 
 from enum import Enum
 
+from ..llm_provider_metadata import requires_api_key
 from ..pg0 import EmbeddedPostgres, parse_pg0_url
 from .entity_resolver import EntityResolver
 from .fact_budget import select_facts_within_budget
-from .llm_wrapper import ConfiguredLLMProvider, LLMConfig, requires_api_key, sanitize_llm_output, sanitize_text
+from .llm_wrapper import ConfiguredLLMProvider, LLMConfig, sanitize_llm_output, sanitize_text
 from .mental_model_refresh import (
     MentalModelDeltaOperations,
     MentalModelDryRunRefreshResult,

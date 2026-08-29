@@ -17,6 +17,19 @@ from dotenv import find_dotenv, load_dotenv
 
 from ._pg_search import normalize_pg_search_tokenizer
 from ._vector_index import validate_extension
+from .llm_provider_metadata import (
+    DEFAULT_LLM_MODEL as DEFAULT_LLM_MODEL,
+)
+from .llm_provider_metadata import (
+    DEFAULT_LLM_PROVIDER,
+    requires_api_key,
+)
+from .llm_provider_metadata import (
+    PROVIDER_DEFAULT_MODELS as PROVIDER_DEFAULT_MODELS,
+)
+from .llm_provider_metadata import (
+    get_default_model_for_provider as _get_default_model_for_provider,
+)
 from .utils import mask_network_location
 
 logger = logging.getLogger(__name__)
@@ -897,40 +910,6 @@ ENV_DISPOSITION_EMPATHY = "HINDSIGHT_API_DISPOSITION_EMPATHY"
 DEFAULT_DATABASE_BACKEND = "postgresql"
 DEFAULT_DATABASE_URL = "pg0"
 DEFAULT_DATABASE_SCHEMA = "public"
-DEFAULT_LLM_PROVIDER = "openai"
-
-# Provider-specific default models
-PROVIDER_DEFAULT_MODELS = {
-    "openai": "gpt-4o-mini",
-    "openai-responses": "gpt-5.6",
-    "anthropic": "claude-haiku-4-5",
-    "gemini": "gemini-3.5-flash",
-    "groq": "openai/gpt-oss-120b",
-    "minimax": "MiniMax-M3",
-    "deepseek": "deepseek-v4-flash",
-    "zai": "glm-4.5-flash",
-    "opencode-go": "deepseek-v4-flash",
-    "atlas": "deepseek-ai/deepseek-v4-pro",
-    "ollama": "gemma3:12b",
-    "ollama-cloud": "gemma3:12b",
-    "llamacpp": "gemma-4-e2b-it",
-    "lmstudio": "local-model",
-    "vertexai": "google/gemini-3.1-flash-lite",
-    "openai-codex": "gpt-5.4-mini",
-    "claude-code": "claude-sonnet-4-5-20250929",
-    "github-copilot": "gpt-5.6-terra",
-    "mock": "mock-model",
-    "none": "none",
-    "litellm": "gpt-4o-mini",
-    "bedrock": "us.amazon.nova-2-lite-v1:0",
-    "volcano": "doubao-pro-32k",
-    "openrouter": "qwen/qwen3.5-9b",
-    "requesty": "openai/gpt-4o-mini",
-    "fireworks": "accounts/fireworks/models/llama-v3p1-8b-instruct",
-    "nous": "deepseek/deepseek-v4-flash",
-    "xai-oauth": "grok-4.5",
-}
-DEFAULT_LLM_MODEL = "gpt-4o-mini"  # Fallback if provider not in table
 # Built-in llama.cpp defaults
 DEFAULT_LLAMACPP_GPU_LAYERS = -1  # -1 = offload all layers to GPU (Metal/CUDA)
 DEFAULT_LLAMACPP_CONTEXT_SIZE = 8192
@@ -1870,11 +1849,6 @@ def _parse_bank_priority(raw: str) -> dict[str, int]:
     return result
 
 
-def _get_default_model_for_provider(provider: str) -> str:
-    """Get the default model for a given provider."""
-    return PROVIDER_DEFAULT_MODELS.get(provider.lower(), DEFAULT_LLM_MODEL)
-
-
 def _parse_llm_router_config(env_var: str) -> dict | None:
     """
     Parse a LiteLLM Router configuration from a JSON env var.
@@ -1979,8 +1953,6 @@ def _parse_llm_members(prefix: str) -> list[LLMMemberConfig]:
     stops at the first index whose ``_PROVIDER`` is unset (so indices must be
     contiguous from 1). ``MODEL`` defaults to the provider's default model.
     """
-    from .engine.llm_wrapper import requires_api_key
-
     members: list[LLMMemberConfig] = []
     index = 1
     while True:
