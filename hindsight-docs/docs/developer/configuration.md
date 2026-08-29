@@ -266,6 +266,8 @@ For non-English banks (especially CJK) and the language/extraction-language trad
 
 | Variable | Description | Default |
 |----------|-------------|---------|
+| `HINDSIGHT_API_INFERENCE_PROFILES_FILE` | Path to a server-owned JSON registry of complete `default`, `retain`, `consolidation`, and `reflect` model routes. Route credentials are referenced by environment-variable name and resolved only by the server. | Unset |
+| `HINDSIGHT_API_INFERENCE_PROFILE` | Global profile ID selected from `HINDSIGHT_API_INFERENCE_PROFILES_FILE`. When set, profile routes replace legacy global/per-operation LLM routing. Banks may select another registered ID through their `inference_profile` config field. | Unset |
 | `HINDSIGHT_API_LLM_PROVIDER` | Provider: `openai`, `openai-responses`, `openai-codex`, `claude-code`, `github-copilot`, `anthropic`, `gemini`, `groq`, `minimax`, `deepseek`, `zai`, `opencode-go`, `nous`, `xai-oauth`, `fireworks`, `ollama`, `ollama-cloud`, `lmstudio`, `llamacpp`, `vertexai`, `bedrock`, `litellm`, `litellmrouter`, `volcano`, `openrouter`, `requesty`, `none` | `openai` |
 | `HINDSIGHT_API_LLM_API_KEY` | API key for providers that require one; unused by `github-copilot` | - |
 | `HINDSIGHT_API_LLM_MODEL` | Model name | `gpt-5-mini` |
@@ -494,6 +496,23 @@ export HINDSIGHT_API_LLM_PROVIDER=none
 :::tip OpenAI Codex, Claude Code & Vertex AI Setup
 For detailed setup instructions for **OpenAI Codex** (ChatGPT Plus/Pro), **Claude Code** (Claude Pro/Max), and **Vertex AI** (Google Cloud), see the [Models documentation](./models#openai-codex-setup-chatgpt-pluspro).
 :::
+
+#### Named inference profiles
+
+A named inference profile is a complete, immutable set of four model routes owned by the server. Use it when one deployment serves banks with different model or gateway policies without storing credentials in bank configuration.
+
+The registry is one JSON object keyed by lowercase profile ID. Every profile must contain exactly `default`, `retain`, `consolidation`, and `reflect`:
+
+    {
+      "production": {
+        "default": {"provider": "openai", "model": "gpt-4o-mini", "api_key_env": "OPENAI_API_KEY"},
+        "retain": {"provider": "openai", "model": "gpt-4o-mini", "api_key_env": "OPENAI_API_KEY"},
+        "consolidation": {"provider": "anthropic", "model": "claude-sonnet-4-5", "api_key_env": "ANTHROPIC_API_KEY"},
+        "reflect": {"provider": "anthropic", "model": "claude-sonnet-4-5", "api_key_env": "ANTHROPIC_API_KEY"}
+      }
+    }
+
+Each route requires `provider` and `model`. Optional fields are `api_key_env`, `base_url`, `reasoning_effort`, `timeout`, `max_retries`, `initial_backoff`, `max_backoff`, `extra_body`, `default_headers`, provider service tiers, `ollama_num_ctx`, and `litellmrouter_config`. Unknown or duplicate fields, incomplete profiles, invalid provider options, unresolved credential variables, and unknown selectors fail at startup or bank-config update. Profile route contents are credential fields: bank config, templates, and health responses expose only the selected profile ID.
 
 ### LLM Router (LiteLLM Router)
 

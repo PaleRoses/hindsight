@@ -22,9 +22,9 @@ import random
 import sys
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Literal, NoReturn, ParamSpec, TypeVar, cast, overload
 
@@ -47,9 +47,12 @@ from ..config import (
     DEFAULT_REFLECT_SOURCE_FACTS_MAX_TOKENS,
     DEFAULT_STORE_DOCUMENT_TEXT,
     ENV_MODEL_INIT_TIMEOUT,
+    INFERENCE_PROFILE_OPERATIONS,
     HindsightConfig,
+    InferenceModelProfile,
     LLMMemberConfig,
     LLMStrategyConfig,
+    StaticConfigProxy,
     get_config,
 )
 from ..tracing import create_operation_span
@@ -94,6 +97,21 @@ _current_schema: contextvars.ContextVar[str | None] = contextvars.ContextVar("cu
 # downstream provider calls can attribute spend per bank — e.g. tagging the OpenAI `user`
 # field for cost gateways. None outside a bank-scoped operation.
 _current_bank_id: contextvars.ContextVar[str | None] = contextvars.ContextVar("current_bank_id", default=None)
+
+
+@dataclass(frozen=True)
+class _BankOperationState:
+    """Resolved routing state owned by one complete engine bank operation."""
+
+    engine: "MemoryEngine"
+    bank_id: str
+    config: HindsightConfig | None
+    request_context: "RequestContext | None"
+
+
+_current_bank_operation: contextvars.ContextVar[_BankOperationState | None] = contextvars.ContextVar(
+    "current_bank_operation", default=None
+)
 
 
 @dataclass
@@ -175,11 +193,11 @@ _R = TypeVar("_R")
 def _bind_bank_id(
     arg: str = "bank_id", key: str | None = None
 ) -> Callable[[Callable[_P, Awaitable[_R]]], Callable[_P, Awaitable[_R]]]:
-    """Bind ``_current_bank_id`` to an argument of the wrapped coroutine for the call's duration.
+    """Bind bank attribution and, for engine methods, resolved inference routing.
 
-    ``arg`` names the parameter carrying the bank id; ``key`` optionally pulls it out of a
-    dict-valued argument (e.g. ``task_dict["bank_id"]``). Token-based set/reset (including on
-    exception) keeps the binding scoped to the call.
+    Free functions retain the historical bank-only behavior. ``MemoryEngine``
+    methods enter the engine-owned operation scope, which resolves the selector
+    once and restores bank/profile state by ContextVar token on every exit path.
     """
 
     def decorate(func: Callable[_P, Awaitable[_R]]) -> Callable[_P, Awaitable[_R]]:
@@ -187,14 +205,33 @@ def _bind_bank_id(
 
         @functools.wraps(func)
         async def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-            value = sig.bind(*args, **kwargs).arguments.get(arg)
-            if key is not None and type(value) is dict:
-                value = value.get(key)
-            token = _current_bank_id.set(value if type(value) is str else None)
+            arguments = sig.bind(*args, **kwargs).arguments
+            value = arguments.get(arg)
+            task_dict = value if key is not None and type(value) is dict else None
+            if task_dict is not None:
+                value = task_dict.get(key)
+            bank_id = value if type(value) is str else None
+            engine = arguments.get("self")
+            operation_scope = getattr(engine, "_bank_operation_scope", None)
+            if operation_scope is not None:
+                request_context = arguments.get("request_context")
+                if task_dict is not None:
+                    from hindsight_api.models import RequestContext
+
+                    request_context = RequestContext(
+                        internal=True,
+                        tenant_id=task_dict.get("_tenant_id"),
+                        api_key_id=task_dict.get("_api_key_id"),
+                        retry_count=task_dict.get("_retry_count", 0),
+                    )
+                async with operation_scope(bank_id, request_context, resolve=False):
+                    return await func(*args, **kwargs)
+
+            bank_token = _current_bank_id.set(bank_id)
             try:
                 return await func(*args, **kwargs)
             finally:
-                _current_bank_id.reset(token)
+                _current_bank_id.reset(bank_token)
 
         return wrapper
 
@@ -606,7 +643,12 @@ class _LLMCallDefaults:
         }
 
 
-def _member_to_llm(member: "LLMMemberConfig", config: HindsightConfig, defaults: _LLMCallDefaults) -> LLMConfig:
+def _member_to_llm(
+    member: "LLMMemberConfig",
+    config: HindsightConfig | StaticConfigProxy,
+    defaults: _LLMCallDefaults,
+    reasoning_effort: str | None = None,
+) -> LLMConfig:
     """Build an LLMProvider from one indexed multi-LLM member.
 
     ``LLMProvider`` uses its arguments verbatim (it no longer reads global config),
@@ -625,9 +667,9 @@ def _member_to_llm(member: "LLMMemberConfig", config: HindsightConfig, defaults:
     return LLMConfig(
         provider=member.provider,
         api_key=member.api_key or "",
-        base_url=member.base_url,
+        base_url=member.base_url or "",
         model=member.model,
-        reasoning_effort=member.reasoning_effort or config.llm_reasoning_effort,
+        reasoning_effort=member.reasoning_effort or reasoning_effort or config.llm_reasoning_effort,
         extra_body=member.extra_body,
         default_headers=member.default_headers or config.llm_default_headers,
         cache_affinity=member.cache_affinity or config.llm_cache_affinity,
@@ -647,7 +689,7 @@ def _member_to_llm(member: "LLMMemberConfig", config: HindsightConfig, defaults:
 
 def _build_llm(
     base: LLMConfig,
-    config: HindsightConfig,
+    config: HindsightConfig | StaticConfigProxy,
     prefix: str,
     defaults: _LLMCallDefaults,
 ) -> "LLMConfig | MultiLLMProvider":
@@ -672,8 +714,53 @@ def _build_llm(
 
     if not strategy or not members:
         return base
-    extra = [_member_to_llm(m, config, defaults) for m in members]
+    extra = [_member_to_llm(m, config, defaults, base.reasoning_effort) for m in members]
     return MultiLLMProvider([base, *extra], strategy)
+
+
+def _mutable_json_copy(value: Any) -> Any:
+    """Copy an explicitly projected immutable JSON payload for a provider client."""
+    if isinstance(value, Mapping):
+        return {key: _mutable_json_copy(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_mutable_json_copy(item) for item in value]
+    return value
+
+
+def _profile_route_to_llm(
+    route: InferenceModelProfile,
+    runtime_config: HindsightConfig,
+) -> LLMConfig:
+    """Construct one named-profile route through the canonical provider implementation."""
+    router_config = route.litellmrouter_config if route.provider == "litellmrouter" else None
+    return LLMConfig(
+        provider=route.provider,
+        api_key=route.api_key or "",
+        base_url=route.base_url or "",
+        model=route.model,
+        reasoning_effort=route.reasoning_effort,
+        extra_body=_mutable_json_copy(route.extra_body),
+        default_headers=_mutable_json_copy(route.default_headers),
+        cache_affinity=runtime_config.llm_cache_affinity,
+        ollama_num_ctx=route.ollama_num_ctx,
+        bedrock_service_tier=route.bedrock_service_tier,
+        structured_output_forced_tool=runtime_config.llm_structured_output_forced_tool,
+        gemini_service_tier=route.gemini_service_tier,
+        groq_service_tier=route.groq_service_tier or runtime_config.llm_groq_service_tier,
+        openai_service_tier=route.openai_service_tier,
+        gemini_safety_settings=runtime_config.llm_gemini_safety_settings,
+        prompt_cache_enabled=runtime_config.llm_prompt_cache_enabled,
+        vertexai_project_id=runtime_config.llm_vertexai_project_id,
+        vertexai_region=runtime_config.llm_vertexai_region,
+        vertexai_service_account_key=runtime_config.llm_vertexai_service_account_key,
+        litellmrouter_config=_mutable_json_copy(router_config),
+        timeout=route.timeout if route.timeout is not None else runtime_config.llm_timeout,
+        max_retries=route.max_retries if route.max_retries is not None else runtime_config.llm_max_retries,
+        initial_backoff=(
+            route.initial_backoff if route.initial_backoff is not None else runtime_config.llm_initial_backoff
+        ),
+        max_backoff=route.max_backoff if route.max_backoff is not None else runtime_config.llm_max_backoff,
+    )
 
 
 async def validate_retain_batch_support(
@@ -1937,16 +2024,16 @@ class MemoryEngine(MemoryEngineInterface):
             skip_llm_verification: Skip LLM connection verification during initialization.
                                   Defaults to HINDSIGHT_API_SKIP_LLM_VERIFICATION env var or False.
         """
+        self._explicit_inference_routes = dict.fromkeys(INFERENCE_PROFILE_OPERATIONS, False)
         # Load config from environment for any missing parameters
         from ..config import _get_raw_config, get_config
 
         config = get_config()
-        # Gemini safety settings are bank-configurable, so the StaticConfigProxy from
-        # get_config() blocks reading them. The server-level default legitimately seeds
-        # each provider at construction (per-bank values are applied per-call via
-        # ConfiguredLLMProvider), so read it from the raw config. The other LLM fields
-        # below are static and safe to read off the proxy.
-        _llm_gemini_safety_settings = _get_raw_config().llm_gemini_safety_settings
+        raw_config = _get_raw_config()
+        # Gemini safety settings and the named-profile selector are bank-configurable,
+        # so the StaticConfigProxy blocks reading them. Their server defaults seed
+        # long-lived providers; ConfigResolver supplies the per-bank selector later.
+        _llm_gemini_safety_settings = raw_config.llm_gemini_safety_settings
 
         # Apply optimization flags from config if not explicitly provided
         self._skip_llm_verification = (
@@ -1957,14 +2044,21 @@ class MemoryEngine(MemoryEngineInterface):
         db_url = db_url or config.database_url
         memory_llm_provider = memory_llm_provider or config.llm_provider
 
-        # Force skip LLM verification when provider is "none" (no LLM to verify)
-        if memory_llm_provider == "none":
+        # There is nothing to verify only when both routing systems are disabled.
+        if memory_llm_provider == "none" and raw_config.inference_profile is None:
             self._skip_llm_verification = True
         memory_llm_api_key = memory_llm_api_key or config.llm_api_key
-        if not memory_llm_api_key and requires_api_key(memory_llm_provider):
+        if not memory_llm_api_key and requires_api_key(memory_llm_provider) and raw_config.inference_profile is None:
             raise ValueError("LLM API key is required. Set HINDSIGHT_API_LLM_API_KEY environment variable.")
+        memory_llm_api_key = memory_llm_api_key or ""
         memory_llm_model = memory_llm_model or config.llm_model
         memory_llm_base_url = memory_llm_base_url or config.get_llm_base_url() or None
+        suppress_legacy_routes = raw_config.inference_profile is not None
+        if suppress_legacy_routes:
+            memory_llm_provider = "none"
+            memory_llm_api_key = ""
+            memory_llm_model = "none"
+            memory_llm_base_url = ""
         # Track pg0 instance (if used)
         self._pg0: EmbeddedPostgres | None = None
 
@@ -2077,29 +2171,30 @@ class MemoryEngine(MemoryEngineInterface):
             vertexai_service_account_key=config.llm_vertexai_service_account_key,
             **default_call_defaults.as_kwargs(),
         )
-        self._llm_config = _build_llm(_default_base_llm, config, "", default_call_defaults)
+        self._legacy_llm_config = (
+            _default_base_llm
+            if suppress_legacy_routes
+            else _build_llm(_default_base_llm, config, "", default_call_defaults)
+        )
 
-        # Store client and model for convenience (deprecated: use _llm_config.call() instead).
-        # Read from the primary member so a multi-LLM chain behaves like the base config here.
-        self._llm_client = _default_base_llm._client
-        self._llm_model = _default_base_llm.model
+        # Deprecated convenience members are rebound after named routes are built.
 
         # Initialize per-operation LLM configs (fall back to default if not specified)
         # Retain LLM config - for fact extraction (benefits from strong structured output)
-        retain_provider = retain_llm_provider or config.retain_llm_provider or memory_llm_provider
-        retain_api_key = retain_llm_api_key or config.retain_llm_api_key or memory_llm_api_key
-        retain_model = retain_llm_model or config.retain_llm_model or memory_llm_model
-        retain_base_url = retain_llm_base_url or config.retain_llm_base_url or memory_llm_base_url
-        # Apply provider-specific base URL defaults for retain
-        if retain_base_url is None:
-            if retain_provider.lower() == "groq":
-                retain_base_url = "https://api.groq.com/openai/v1"
-            elif retain_provider.lower() == "ollama":
-                retain_base_url = "http://localhost:11434/v1"
-            elif retain_provider.lower() == "ollama-cloud":
-                retain_base_url = "https://ollama.com/v1"
-            else:
-                retain_base_url = ""
+        retain_provider = (
+            "none"
+            if suppress_legacy_routes
+            else retain_llm_provider or config.retain_llm_provider or memory_llm_provider
+        )
+        retain_api_key = (
+            "" if suppress_legacy_routes else retain_llm_api_key or config.retain_llm_api_key or memory_llm_api_key
+        )
+        retain_model = (
+            "none" if suppress_legacy_routes else retain_llm_model or config.retain_llm_model or memory_llm_model
+        )
+        retain_base_url = (
+            "" if suppress_legacy_routes else retain_llm_base_url or config.retain_llm_base_url or memory_llm_base_url
+        )
 
         _retain_base_llm = LLMConfig(
             provider=retain_provider,
@@ -2124,23 +2219,27 @@ class MemoryEngine(MemoryEngineInterface):
             vertexai_service_account_key=config.llm_vertexai_service_account_key,
             **retain_call_defaults.as_kwargs(),
         )
-        self._retain_llm_config = _build_llm(_retain_base_llm, config, "retain_", retain_call_defaults)
+        self._legacy_retain_llm_config = (
+            _retain_base_llm
+            if suppress_legacy_routes
+            else _build_llm(_retain_base_llm, config, "retain_", retain_call_defaults)
+        )
 
         # Reflect LLM config - for think/observe operations (can use lighter models)
-        reflect_provider = reflect_llm_provider or config.reflect_llm_provider or memory_llm_provider
-        reflect_api_key = reflect_llm_api_key or config.reflect_llm_api_key or memory_llm_api_key
-        reflect_model = reflect_llm_model or config.reflect_llm_model or memory_llm_model
-        reflect_base_url = reflect_llm_base_url or config.reflect_llm_base_url or memory_llm_base_url
-        # Apply provider-specific base URL defaults for reflect
-        if reflect_base_url is None:
-            if reflect_provider.lower() == "groq":
-                reflect_base_url = "https://api.groq.com/openai/v1"
-            elif reflect_provider.lower() == "ollama":
-                reflect_base_url = "http://localhost:11434/v1"
-            elif reflect_provider.lower() == "ollama-cloud":
-                reflect_base_url = "https://ollama.com/v1"
-            else:
-                reflect_base_url = ""
+        reflect_provider = (
+            "none"
+            if suppress_legacy_routes
+            else reflect_llm_provider or config.reflect_llm_provider or memory_llm_provider
+        )
+        reflect_api_key = (
+            "" if suppress_legacy_routes else reflect_llm_api_key or config.reflect_llm_api_key or memory_llm_api_key
+        )
+        reflect_model = (
+            "none" if suppress_legacy_routes else reflect_llm_model or config.reflect_llm_model or memory_llm_model
+        )
+        reflect_base_url = (
+            "" if suppress_legacy_routes else reflect_llm_base_url or config.reflect_llm_base_url or memory_llm_base_url
+        )
 
         _reflect_base_llm = LLMConfig(
             provider=reflect_provider,
@@ -2165,23 +2264,33 @@ class MemoryEngine(MemoryEngineInterface):
             vertexai_service_account_key=config.llm_vertexai_service_account_key,
             **reflect_call_defaults.as_kwargs(),
         )
-        self._reflect_llm_config = _build_llm(_reflect_base_llm, config, "reflect_", reflect_call_defaults)
+        self._legacy_reflect_llm_config = (
+            _reflect_base_llm
+            if suppress_legacy_routes
+            else _build_llm(_reflect_base_llm, config, "reflect_", reflect_call_defaults)
+        )
 
         # Consolidation LLM config - for mental model consolidation (can use efficient models)
-        consolidation_provider = consolidation_llm_provider or config.consolidation_llm_provider or memory_llm_provider
-        consolidation_api_key = consolidation_llm_api_key or config.consolidation_llm_api_key or memory_llm_api_key
-        consolidation_model = consolidation_llm_model or config.consolidation_llm_model or memory_llm_model
-        consolidation_base_url = consolidation_llm_base_url or config.consolidation_llm_base_url or memory_llm_base_url
-        # Apply provider-specific base URL defaults for consolidation
-        if consolidation_base_url is None:
-            if consolidation_provider.lower() == "groq":
-                consolidation_base_url = "https://api.groq.com/openai/v1"
-            elif consolidation_provider.lower() == "ollama":
-                consolidation_base_url = "http://localhost:11434/v1"
-            elif consolidation_provider.lower() == "ollama-cloud":
-                consolidation_base_url = "https://ollama.com/v1"
-            else:
-                consolidation_base_url = ""
+        consolidation_provider = (
+            "none"
+            if suppress_legacy_routes
+            else consolidation_llm_provider or config.consolidation_llm_provider or memory_llm_provider
+        )
+        consolidation_api_key = (
+            ""
+            if suppress_legacy_routes
+            else consolidation_llm_api_key or config.consolidation_llm_api_key or memory_llm_api_key
+        )
+        consolidation_model = (
+            "none"
+            if suppress_legacy_routes
+            else consolidation_llm_model or config.consolidation_llm_model or memory_llm_model
+        )
+        consolidation_base_url = (
+            ""
+            if suppress_legacy_routes
+            else consolidation_llm_base_url or config.consolidation_llm_base_url or memory_llm_base_url
+        )
 
         _consolidation_base_llm = LLMConfig(
             provider=consolidation_provider,
@@ -2206,9 +2315,27 @@ class MemoryEngine(MemoryEngineInterface):
             vertexai_service_account_key=config.llm_vertexai_service_account_key,
             **consolidation_call_defaults.as_kwargs(),
         )
-        self._consolidation_llm_config = _build_llm(
-            _consolidation_base_llm, config, "consolidation_", consolidation_call_defaults
+        self._legacy_consolidation_llm_config = (
+            _consolidation_base_llm
+            if suppress_legacy_routes
+            else _build_llm(_consolidation_base_llm, config, "consolidation_", consolidation_call_defaults)
         )
+        self._global_inference_profile = raw_config.inference_profile
+        # Eager executable projection of the canonical static registry. The
+        # HindsightConfig profiles remain the only route-definition authority.
+        self._inference_profile_llms = {
+            profile_id: {
+                operation: _profile_route_to_llm(
+                    profile.route(operation),
+                    raw_config,
+                )
+                for operation in INFERENCE_PROFILE_OPERATIONS
+            }
+            for profile_id, profile in raw_config.inference_profiles.items()
+        }
+        selected_default = self._inference_llm("default")
+        self._llm_client = selected_default._client
+        self._llm_model = selected_default.model
 
         # Initialize cross-encoder reranker (cached for performance)
         self._cross_encoder_reranker = CrossEncoderReranker(cross_encoder=cross_encoder)
@@ -2328,6 +2455,162 @@ class MemoryEngine(MemoryEngineInterface):
                 max_entries=config.bank_stats_cache_max_entries,
             )
 
+    @asynccontextmanager
+    async def _bank_operation_scope(
+        self,
+        bank_id: str | None,
+        request_context: "RequestContext | None" = None,
+        *,
+        resolve: bool = True,
+    ) -> AsyncIterator[HindsightConfig | None]:
+        """Own one bank's selector binding for the complete engine operation.
+
+        Decorated public methods enter lazily so authentication remains ahead of
+        tenant/bank config access. Their first ``_resolve_full_config`` call binds
+        the resolved selector into this token-owned scope. Direct callers may use
+        the eager default. Nested calls for the same engine and bank reuse the
+        resolved config, avoiding duplicate queries. Token reset restores caller
+        state after normal return, exceptions, cancellation, and child-task copies.
+        """
+        bank_token = _current_bank_id.set(bank_id)
+        try:
+            existing = _current_bank_operation.get()
+            resolved_config: HindsightConfig | None
+            if (
+                bank_id is not None
+                and existing is not None
+                and existing.engine is self
+                and existing.bank_id == bank_id
+                and existing.config is not None
+            ):
+                resolved_config = existing.config
+            elif resolve:
+                if bank_id is not None:
+                    resolved_config = await self._resolve_full_config(bank_id, request_context)
+                else:
+                    from ..config import _get_raw_config
+
+                    resolved_config = _get_raw_config()
+            else:
+                resolved_config = None
+
+            operation_state = (
+                _BankOperationState(
+                    engine=self,
+                    bank_id=bank_id,
+                    config=resolved_config,
+                    request_context=request_context,
+                )
+                if bank_id is not None
+                else None
+            )
+            operation_token = _current_bank_operation.set(operation_state)
+            try:
+                yield copy.copy(resolved_config) if resolved_config is not None else None
+            finally:
+                _current_bank_operation.reset(operation_token)
+        finally:
+            _current_bank_id.reset(bank_token)
+
+    async def _resolve_full_config(
+        self,
+        bank_id: str,
+        request_context: "RequestContext | None" = None,
+    ) -> HindsightConfig:
+        """Resolve once, then bind the selector into the active operation scope."""
+        operation = _current_bank_operation.get()
+        if (
+            request_context is None
+            and operation is not None
+            and operation.engine is self
+            and operation.bank_id == bank_id
+        ):
+            request_context = operation.request_context
+        if (
+            operation is not None
+            and operation.engine is self
+            and operation.bank_id == bank_id
+            and operation.config is not None
+        ):
+            return copy.copy(operation.config)
+
+        resolved_config = await self._config_resolver.resolve_full_config(
+            bank_id,
+            request_context,
+        )
+
+        if operation is not None and operation.engine is self and operation.bank_id == bank_id:
+            _current_bank_operation.set(replace(operation, config=resolved_config))
+        return copy.copy(resolved_config)
+
+    def _inference_llm(self, operation: str) -> "LLMConfig | MultiLLMProvider":
+        """Resolve the active named profile or an explicitly installed legacy test route."""
+        if not hasattr(self, "_inference_profile_llms"):
+            legacy_attribute = {
+                "default": "_legacy_llm_config",
+                "retain": "_legacy_retain_llm_config",
+                "reflect": "_legacy_reflect_llm_config",
+                "consolidation": "_legacy_consolidation_llm_config",
+            }[operation]
+            return getattr(self, legacy_attribute)
+        operation_state = _current_bank_operation.get()
+        profile_id = (
+            getattr(operation_state.config, "inference_profile", None)
+            if operation_state is not None and operation_state.engine is self and operation_state.config is not None
+            else self._global_inference_profile
+        )
+        if profile_id is not None and not self._explicit_inference_routes[operation]:
+            return self._inference_profile_llms[profile_id][operation]
+        legacy = {
+            "default": self._legacy_llm_config,
+            "retain": self._legacy_retain_llm_config,
+            "reflect": self._legacy_reflect_llm_config,
+            "consolidation": self._legacy_consolidation_llm_config,
+        }[operation]
+        if legacy is None:
+            raise RuntimeError(f"LLM route {operation!r} was not initialized")
+        return legacy
+
+    @property
+    def _llm_config(self) -> "LLMConfig | MultiLLMProvider":
+        return self._inference_llm("default")
+
+    @_llm_config.setter
+    def _llm_config(self, value: "LLMConfig | MultiLLMProvider") -> None:
+        self._legacy_llm_config = value
+        if hasattr(self, "_explicit_inference_routes"):
+            self._explicit_inference_routes["default"] = True
+
+    @property
+    def _retain_llm_config(self) -> "LLMConfig | MultiLLMProvider":
+        return self._inference_llm("retain")
+
+    @_retain_llm_config.setter
+    def _retain_llm_config(self, value: "LLMConfig | MultiLLMProvider") -> None:
+        self._legacy_retain_llm_config = value
+        if hasattr(self, "_explicit_inference_routes"):
+            self._explicit_inference_routes["retain"] = True
+
+    @property
+    def _reflect_llm_config(self) -> "LLMConfig | MultiLLMProvider":
+        return self._inference_llm("reflect")
+
+    @_reflect_llm_config.setter
+    def _reflect_llm_config(self, value: "LLMConfig | MultiLLMProvider | None") -> None:
+        self._legacy_reflect_llm_config = value
+        if hasattr(self, "_explicit_inference_routes"):
+            self._explicit_inference_routes["reflect"] = True
+
+    @property
+    def _consolidation_llm_config(self) -> "LLMConfig | MultiLLMProvider":
+        return self._inference_llm("consolidation")
+
+    @_consolidation_llm_config.setter
+    def _consolidation_llm_config(self, value: "LLMConfig | MultiLLMProvider") -> None:
+        self._legacy_consolidation_llm_config = value
+        if hasattr(self, "_explicit_inference_routes"):
+            self._explicit_inference_routes["consolidation"] = True
+
     @property
     def audit_logger(self) -> AuditLogger:
         """The audit logger for feature usage tracking."""
@@ -2353,7 +2636,7 @@ class MemoryEngine(MemoryEngineInterface):
         # applies the tenant permission filter (get_allowed_config_fields), so an
         # extension that makes audit_log_enabled read-only for a user would strip
         # the field here and silently revert gating to the deployment default.
-        config = await resolver.resolve_full_config(bank_id, context)
+        config = await self._resolve_full_config(bank_id, context)
         return config.audit_log_enabled
 
     @property
@@ -2889,11 +3172,6 @@ class MemoryEngine(MemoryEngineInterface):
         if not bank_id:
             raise ValueError("bank_id is required for consolidation task")
 
-        # Skip consolidation when LLM provider is "none"
-        if self._llm_config.provider == "none":
-            logger.info(f"[CONSOLIDATION] Skipping consolidation for bank {bank_id}: LLM provider is 'none'")
-            return {"memories_processed": 0, "skipped": True}
-
         from hindsight_api.models import RequestContext
 
         from .consolidation import run_consolidation_job
@@ -2906,6 +3184,7 @@ class MemoryEngine(MemoryEngineInterface):
             api_key_id=task_dict.get("_api_key_id"),
             retry_count=task_dict.get("_retry_count", 0),
         )
+        await self._resolve_full_config(bank_id, internal_context)
         result = await run_consolidation_job(
             memory_engine=self,
             bank_id=bank_id,
@@ -4126,6 +4405,37 @@ class MemoryEngine(MemoryEngineInterface):
             # Re-raise to rollback the transaction
             raise
 
+    async def _verify_llm_connections(self) -> None:
+        """Verify every active operation route before accepting work."""
+        if self._skip_llm_verification:
+            return
+
+        configs_to_verify = tuple(
+            (operation, self._inference_llm(operation)) for operation in INFERENCE_PROFILE_OPERATIONS
+        )
+        for config_name, llm_config in configs_to_verify:
+            try:
+                await llm_config.verify_connection()
+            except Exception as exc:
+                logger.warning(
+                    "LLM connection verification failed for '%s' config: %s. "
+                    "Server will start but LLM-dependent operations may fail "
+                    "until the provider is available.",
+                    config_name,
+                    exc,
+                )
+
+        if get_config().retain_batch_enabled:
+            supports_batch = await self._retain_llm_config._provider_impl.supports_batch_api()
+            if not supports_batch:
+                raise RuntimeError(
+                    f"Configuration error: HINDSIGHT_API_RETAIN_BATCH_ENABLED=true "
+                    f"but the retain LLM provider '{self._retain_llm_config.provider}' "
+                    f"does not support the batch API. Either switch to a provider "
+                    f"that supports batch operations (e.g. 'openai', 'groq', 'gemini') or "
+                    f"set HINDSIGHT_API_RETAIN_BATCH_ENABLED=false."
+                )
+
     async def initialize(self):
         """Initialize the connection pool, models, and background workers.
 
@@ -4271,7 +4581,7 @@ class MemoryEngine(MemoryEngineInterface):
 
         # Only verify LLM if not skipping
         if not self._skip_llm_verification:
-            init_tasks.append(verify_llm())
+            init_tasks.append(self._verify_llm_connections())
 
         # Run pg0 and selected model initializations in parallel.
         # Cap the whole thing with a wall-clock timeout so a hung init task
@@ -4689,13 +4999,18 @@ class MemoryEngine(MemoryEngineInterface):
 
         self._initialized = False
 
-        # Clean up LLM providers (e.g. stop llamacpp subprocess)
-        for llm_config in (
-            self._llm_config,
-            self._retain_llm_config,
-            self._reflect_llm_config,
-            self._consolidation_llm_config,
-        ):
+        llm_configs = [
+            self._legacy_llm_config,
+            self._legacy_retain_llm_config,
+            self._legacy_reflect_llm_config,
+            self._legacy_consolidation_llm_config,
+            *(route for profile_routes in self._inference_profile_llms.values() for route in profile_routes.values()),
+        ]
+        cleaned: set[int] = set()
+        for llm_config in llm_configs:
+            if id(llm_config) in cleaned:
+                continue
+            cleaned.add(id(llm_config))
             try:
                 await llm_config.cleanup()
             except Exception as e:
@@ -5667,14 +5982,13 @@ class MemoryEngine(MemoryEngineInterface):
         await self._get_backend()
 
         # Resolve bank-specific config for this operation
-        resolved_config = await self._config_resolver.resolve_full_config(bank_id, request_context)
+        resolved_config = await self._resolve_full_config(bank_id, request_context)
 
-        # Force chunks mode when LLM provider is "none" (no LLM available for fact extraction)
-        if self._llm_config.provider == "none":
+        # Derive disabled behavior from the final bank-selected routes.
+        if self._retain_llm_config.provider == "none":
             resolved_config.retain_extraction_mode = "chunks"
+        if self._consolidation_llm_config.provider == "none":
             resolved_config.enable_observations = False
-
-        # Apply strategy overrides: explicit strategy > bank default strategy
         from hindsight_api.config_resolver import apply_strategy
 
         effective_strategy = strategy or resolved_config.retain_default_strategy
@@ -6009,7 +6323,7 @@ class MemoryEngine(MemoryEngineInterface):
         # Imports insert across many per-document transactions, so the bank is
         # created up front on its own connection rather than coupled to a write.
         await self._ensure_bank_exists(bank_id, request_context)
-        resolved_config = await self._config_resolver.resolve_full_config(bank_id, request_context)
+        resolved_config = await self._resolve_full_config(bank_id, request_context)
         outbox_factory = self._build_retain_outbox_callback_factory(
             bank_id=bank_id, operation_id=None, schema=_current_schema.get()
         )
@@ -8208,7 +8522,7 @@ class MemoryEngine(MemoryEngineInterface):
                 logger.warning(f"Failed to invalidate bank stats cache after document deletion for bank {bank_id}: {e}")
 
         if invalidated_obs > 0:
-            config = await self._config_resolver.resolve_full_config(bank_id, request_context)
+            config = await self._resolve_full_config(bank_id, request_context)
             if config.enable_auto_consolidation:
                 try:
                     await self.submit_async_consolidation(bank_id=bank_id, request_context=request_context)
@@ -8437,7 +8751,7 @@ class MemoryEngine(MemoryEngineInterface):
                 await self._bank_stats_cache.invalidate(get_current_schema(), bank_id)
             except Exception as e:
                 logger.warning(f"Failed to invalidate bank stats cache after document update for bank {bank_id}: {e}")
-            config = await self._config_resolver.resolve_full_config(bank_id, request_context)
+            config = await self._resolve_full_config(bank_id, request_context)
             if config.enable_auto_consolidation:
                 try:
                     await self.submit_async_consolidation(bank_id=bank_id, request_context=request_context)
@@ -8592,7 +8906,7 @@ class MemoryEngine(MemoryEngineInterface):
                 )
 
         if bank_id_for_consolidation:
-            config = await self._config_resolver.resolve_full_config(bank_id_for_consolidation, request_context)
+            config = await self._resolve_full_config(bank_id_for_consolidation, request_context)
             if config.enable_auto_consolidation:
                 try:
                     await self.submit_async_consolidation(
@@ -8793,7 +9107,7 @@ class MemoryEngine(MemoryEngineInterface):
 
         for bank_id in banks_with_invalidated_obs:
             try:
-                config = await self._config_resolver.resolve_full_config(bank_id, request_context)
+                config = await self._resolve_full_config(bank_id, request_context)
                 if config.enable_auto_consolidation:
                     await self.submit_async_consolidation(bank_id=bank_id, request_context=request_context)
             except Exception as e:
@@ -9055,7 +9369,7 @@ class MemoryEngine(MemoryEngineInterface):
         await self._bank_stats_cache.invalidate(get_current_schema(), bank_id)
 
         if invalidated_obs > 0:
-            config = await self._config_resolver.resolve_full_config(bank_id, request_context)
+            config = await self._resolve_full_config(bank_id, request_context)
             if config.enable_auto_consolidation:
                 try:
                     await self.submit_async_consolidation(bank_id=bank_id, request_context=request_context)
@@ -9341,7 +9655,7 @@ class MemoryEngine(MemoryEngineInterface):
                         )
 
         if deleted_count > 0:
-            config = await self._config_resolver.resolve_full_config(bank_id, request_context)
+            config = await self._resolve_full_config(bank_id, request_context)
             if config.enable_auto_consolidation:
                 await self.submit_async_consolidation(bank_id=bank_id, request_context=request_context)
 
@@ -9491,7 +9805,7 @@ class MemoryEngine(MemoryEngineInterface):
         # so corrected entities are matched with the same rules retain uses.
         entity_labels = None
         if new_entities is not None:
-            edit_config = await self._config_resolver.resolve_full_config(bank_id, request_context)
+            edit_config = await self._resolve_full_config(bank_id, request_context)
             entity_labels = getattr(edit_config, "entity_labels", None)
 
         need_consolidation = False
@@ -9900,7 +10214,7 @@ class MemoryEngine(MemoryEngineInterface):
                     logger.warning(f"Failed to submit orphan-entity cleanup after a failed edit in bank {bank_id}: {e}")
 
         if need_consolidation:
-            config = await self._config_resolver.resolve_full_config(bank_id, request_context)
+            config = await self._resolve_full_config(bank_id, request_context)
             if config.enable_auto_consolidation:
                 try:
                     await self.submit_async_consolidation(bank_id=bank_id, request_context=request_context)
@@ -9925,6 +10239,7 @@ class MemoryEngine(MemoryEngineInterface):
 
         return await self.get_memory_unit(bank_id=bank_id, memory_id=memory_id, request_context=request_context)
 
+    @_bind_bank_id()
     async def run_consolidation(
         self,
         bank_id: str,
@@ -9942,6 +10257,7 @@ class MemoryEngine(MemoryEngineInterface):
             Dictionary with consolidation stats
         """
         await self._authenticate_tenant(request_context)
+        await self._resolve_full_config(bank_id, request_context)
         if self._operation_validator:
             from hindsight_api.extensions import BankWriteContext, BankWriteOperation
 
@@ -10320,6 +10636,7 @@ class MemoryEngine(MemoryEngineInterface):
         }
     )
 
+    @_bind_bank_id()
     async def extract_dry_run(
         self,
         bank_id: str,
@@ -10345,8 +10662,11 @@ class MemoryEngine(MemoryEngineInterface):
 
         # Resolve the tenant schema before touching any bank-scoped data (config, bank profile).
         await self._authenticate_tenant(request_context)
-        resolved_config = await self._config_resolver.resolve_full_config(bank_id, request_context)
-        if self._llm_config.provider == "none":
+        resolved_config = await self._resolve_full_config(bank_id, request_context)
+        availability_llm = (
+            self._retain_llm_config if resolved_config.inference_profile is not None else self._llm_config
+        )
+        if availability_llm.provider == "none":
             resolved_config.retain_extraction_mode = "chunks"
 
         for key, value in (overrides or {}).items():
@@ -11860,7 +12180,8 @@ class MemoryEngine(MemoryEngineInterface):
                 await self._validate_operation(self._operation_validator.validate_mental_model_get(get_context))
 
         if mental_model_ids:
-            self._raise_if_mental_model_refresh_unavailable()
+            async with self._bank_operation_scope(bank_id, request_context):
+                self._raise_if_mental_model_refresh_unavailable()
 
         # Create the bank only after every validation succeeds. Applying the default
         # template before installing the scope prevents its operations from
@@ -12162,6 +12483,7 @@ class MemoryEngine(MemoryEngineInterface):
         await bank_utils.set_bank_mission(self._backend, bank_id, mission)
         return {"bank_id": bank_id, "mission": mission}
 
+    @_bind_bank_id()
     async def merge_bank_mission(
         self,
         bank_id: str,
@@ -12190,6 +12512,7 @@ class MemoryEngine(MemoryEngineInterface):
             )
             await self._validate_operation(self._operation_validator.validate_bank_write(ctx))
         await self._get_backend()
+        await self._resolve_full_config(bank_id, request_context)
         return await bank_utils.merge_bank_mission(self._backend, self._reflect_llm_config, bank_id, new_info)
 
     async def list_banks(
@@ -12324,12 +12647,13 @@ class MemoryEngine(MemoryEngineInterface):
         # crash logging, recall's embedder, or the reflect LLM call (see issue #1875).
         query = sanitize_text(query) or ""
         context = sanitize_text(context)
+        # Authenticate tenant and set schema in context (for fq_table()), then bind
+        # the bank-selected inference profile before inspecting or using its route.
+        await self._authenticate_tenant(request_context)
+        resolved_reflect_config = await self._resolve_full_config(bank_id, request_context)
 
-        # Use cached LLM config
         if self._reflect_llm_config is None:
             raise ValueError("Memory LLM API key not set. Set HINDSIGHT_API_LLM_API_KEY environment variable.")
-
-        # Block reflect when the reflect LLM provider is "none"
         if self._reflect_llm_config.provider == "none":
             from .providers.none_llm import LLMNotAvailableError
 
@@ -12337,9 +12661,6 @@ class MemoryEngine(MemoryEngineInterface):
                 "Reflect requires an LLM provider. Current provider is set to 'none'. "
                 "Set HINDSIGHT_API_LLM_PROVIDER to a real provider (e.g., openai, anthropic, gemini)."
             )
-
-        # Authenticate tenant and set schema in context (for fq_table())
-        await self._authenticate_tenant(request_context)
 
         # Cooperative cancellation checkpoint: if the client already disconnected
         # while this request waited to be scheduled, abort before doing any work
@@ -12371,8 +12692,6 @@ class MemoryEngine(MemoryEngineInterface):
         # NOTE: Mental models are NOT pre-loaded to keep the initial prompt small.
         # The agent can call lookup() to list available models if needed.
         # This is critical for banks with many mental models to avoid huge prompts.
-
-        resolved_reflect_config = await self._config_resolver.resolve_full_config(bank_id, request_context)
 
         # Compute max iterations based on budget
         config = get_config()
@@ -13330,6 +13649,7 @@ class MemoryEngine(MemoryEngineInterface):
             status = "auth_failed" if _is_auth_error(e) else "unreachable"
             return _LlmProbeOutcome(ok=False, status=status, latency_ms=(time.monotonic() - start) * 1000)
 
+    @_bind_bank_id()
     async def check_bank_llm(
         self,
         bank_id: str,
@@ -13352,6 +13672,7 @@ class MemoryEngine(MemoryEngineInterface):
                 bank_id=bank_id, operation=BankReadOperation.GET_BANK_STATS, request_context=request_context
             )
             await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
+        await self._resolve_full_config(bank_id, request_context)
 
         per_operation_llm = [
             ("retain", self._retain_llm_config),
@@ -14774,6 +15095,7 @@ class MemoryEngine(MemoryEngineInterface):
             outcome="content_written" if final_content.strip() != current_content else "content_unchanged",
         )
 
+    @_bind_bank_id()
     async def refresh_mental_model(
         self,
         bank_id: str,
@@ -14809,6 +15131,7 @@ class MemoryEngine(MemoryEngineInterface):
                 the same window again.
         """
         await self._authenticate_tenant(request_context)
+        await self._resolve_full_config(bank_id, request_context)
 
         # Get the current mental model
         mental_model = await self.get_mental_model(bank_id, mental_model_id, request_context=request_context)
@@ -18909,6 +19232,7 @@ class MemoryEngine(MemoryEngineInterface):
             # picks it up. Logged loudly so a persistent failure is visible.
             logger.exception(f"Vector index maintenance follow-up submit failed for bank {bank_id}")
 
+    @_bind_bank_id()
     async def submit_async_refresh_mental_model(
         self,
         bank_id: str,
@@ -18953,9 +19277,9 @@ class MemoryEngine(MemoryEngineInterface):
             suppressed, together with ``deduplicated=True``, so the caller can poll
             that one to completion either way.
         """
-        self._raise_if_mental_model_refresh_unavailable()
-
         await self._authenticate_tenant(request_context)
+        await self._resolve_full_config(bank_id, request_context)
+        self._raise_if_mental_model_refresh_unavailable()
 
         # Pre-operation validation (credit check)
         if self._operation_validator:
@@ -19060,7 +19384,8 @@ class MemoryEngine(MemoryEngineInterface):
 
     def _raise_if_mental_model_refresh_unavailable(self) -> None:
         """Reject refresh work before callers make any dependent writes."""
-        if self._llm_config.provider != "none":
+        availability_llm = self._reflect_llm_config
+        if availability_llm.provider != "none":
             return
 
         from .providers.none_llm import LLMNotAvailableError

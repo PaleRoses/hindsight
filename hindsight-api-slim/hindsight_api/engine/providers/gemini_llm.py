@@ -196,6 +196,15 @@ class GeminiLLM(LLMInterface):
         # (env: HINDSIGHT_API_LLM_EXTRA_BODY).
         self._extra_body: dict[str, Any] = kwargs.get("extra_body") or {}
 
+        timeout = kwargs.get("timeout")
+        self._http_options: dict[str, Any] = {}
+        if self.base_url:
+            self._http_options["base_url"] = self.base_url
+        if timeout is not None:
+            self._http_options["timeout"] = round(timeout * 1000)
+        if default_headers := kwargs.get("default_headers"):
+            self._http_options["headers"] = dict(default_headers)
+
         # Context-cache manager. Lazy-initialized on first cache lookup so
         # nothing happens for models/workloads that never reach it. The instance
         # default here is off (a directly-constructed GeminiLLM doesn't cache); the
@@ -214,7 +223,7 @@ class GeminiLLM(LLMInterface):
         if not self.api_key:
             raise ValueError("Gemini provider requires api_key")
 
-        self._client = genai.Client(api_key=self.api_key)
+        self._client = genai.Client(api_key=self.api_key, http_options=self._http_options or None)
         logger.info(f"Gemini API: model={self.model}")
 
     def _apply_service_tier(self, config_kwargs: dict[str, Any]) -> None:
@@ -273,6 +282,8 @@ class GeminiLLM(LLMInterface):
         }
         if credentials is not None:
             client_kwargs["credentials"] = credentials
+        if self._http_options:
+            client_kwargs["http_options"] = self._http_options
 
         self._client = genai.Client(**client_kwargs)
 

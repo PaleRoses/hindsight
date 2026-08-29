@@ -1266,36 +1266,32 @@ async def run_consolidation_job(
     Returns:
         Dict with consolidation results
     """
-    # Resolve bank-specific config with hierarchical overrides
-    config = await memory_engine._config_resolver.resolve_full_config(bank_id, request_context)
-
-    # Build a configured LLM wrapper that applies per-bank settings (e.g. safety settings)
-    # to every call without leaking across operations.
-    llm_config = memory_engine._consolidation_llm_config.with_config(config, bank_id=bank_id, operation="consolidation")
-
-    # Bind the operation trace context for the whole run so the create/update DB
-    # sites (deep inside _process_memory_batch) can accumulate the observations
-    # this consolidation produced and the source memories it consumed onto the
-    # trace — flushed onto every trace row on exit by attach_memory_ids.
-    trace_ctx = trace_context_of(llm_config)
-    trace_token = set_trace_context(trace_ctx) if trace_ctx is not None else None
-    try:
-        return await _run_consolidation_job(
-            memory_engine,
-            bank_id,
-            request_context,
-            config,
-            llm_config,
-            operation_id,
-            observation_scopes,
-            pending_refresh_tags,
+    async with memory_engine._bank_operation_scope(bank_id, request_context):
+        config = await memory_engine._resolve_full_config(bank_id, request_context)
+        llm_config = memory_engine._consolidation_llm_config.with_config(
+            config, bank_id=bank_id, operation="consolidation"
         )
-    finally:
-        if trace_token is not None:
-            reset_trace_context(trace_token)
-            # Fire-and-forget: patched on a background task, off the consolidation
-            # critical path.
-            memory_engine._llm_recorder.attach_memory_ids(trace_ctx)
+        if llm_config.provider == "none":
+            logger.debug(f"Consolidation disabled for bank {bank_id}: selected route is 'none'")
+            return {"skipped": True, "memories_processed": 0, "mental_models_updated": 0}
+
+        trace_ctx = trace_context_of(llm_config)
+        trace_token = set_trace_context(trace_ctx) if trace_ctx is not None else None
+        try:
+            return await _run_consolidation_job(
+                memory_engine,
+                bank_id,
+                request_context,
+                config,
+                llm_config,
+                operation_id,
+                observation_scopes,
+                pending_refresh_tags,
+            )
+        finally:
+            if trace_token is not None:
+                reset_trace_context(trace_token)
+                memory_engine._llm_recorder.attach_memory_ids(trace_ctx)
 
 
 async def _run_consolidation_job(

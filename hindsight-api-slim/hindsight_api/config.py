@@ -6,12 +6,15 @@ All environment variables and their defaults are defined here.
 
 import json
 import logging
+import math
 import os
 import re
 import sys
 from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
-from typing import Any, Literal
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any, Literal, Mapping, cast
 
 from dotenv import find_dotenv, load_dotenv
 
@@ -22,13 +25,12 @@ from .llm_provider_metadata import (
 )
 from .llm_provider_metadata import (
     DEFAULT_LLM_PROVIDER,
+    get_default_model_for_provider,
+    get_llm_provider_metadata,
     requires_api_key,
 )
 from .llm_provider_metadata import (
     PROVIDER_DEFAULT_MODELS as PROVIDER_DEFAULT_MODELS,
-)
-from .llm_provider_metadata import (
-    get_default_model_for_provider as _get_default_model_for_provider,
 )
 from .utils import mask_network_location
 
@@ -162,6 +164,8 @@ ENV_LLM_PROVIDER = "HINDSIGHT_API_LLM_PROVIDER"
 ENV_LLM_API_KEY = "HINDSIGHT_API_LLM_API_KEY"
 ENV_LLM_MODEL = "HINDSIGHT_API_LLM_MODEL"
 ENV_LLM_BASE_URL = "HINDSIGHT_API_LLM_BASE_URL"
+ENV_INFERENCE_PROFILES_FILE = "HINDSIGHT_API_INFERENCE_PROFILES_FILE"
+ENV_INFERENCE_PROFILE = "HINDSIGHT_API_INFERENCE_PROFILE"
 ENV_LLM_MAX_CONCURRENT = "HINDSIGHT_API_LLM_MAX_CONCURRENT"
 ENV_LLM_MAX_RETRIES = "HINDSIGHT_API_LLM_MAX_RETRIES"
 ENV_LLM_INITIAL_BACKOFF = "HINDSIGHT_API_LLM_INITIAL_BACKOFF"
@@ -1269,6 +1273,7 @@ DEFAULT_STORE_DOCUMENT_TEXT = True  # Persist raw source text in documents.origi
 DEFAULT_ENABLE_DOCUMENT_EXPORT_API = True
 DEFAULT_ENABLE_DOCUMENT_IMPORT_API = True
 
+
 # Observations defaults (consolidated knowledge from facts)
 DEFAULT_ENABLE_OBSERVATIONS = True  # Observations enabled by default
 DEFAULT_ENABLE_AUTO_CONSOLIDATION = True  # Auto-consolidation after retain enabled by default
@@ -1655,6 +1660,14 @@ def _parse_str_list(value: str) -> list[str]:
     return [v.strip() for v in value.split(",") if v.strip()]
 
 
+def _parse_optional_int(raw: str | None) -> int | None:
+    return int(raw) if raw else None
+
+
+def _parse_optional_float(raw: str | None) -> float | None:
+    return float(raw) if raw else None
+
+
 def _parse_positive_int(name: str, raw: str | None, default: int) -> int:
     """
     Parse an env var that must be a positive integer (>= 1).
@@ -1867,6 +1880,362 @@ def _parse_llm_router_config(env_var: str) -> dict | None:
         raise ValueError(f"Invalid {env_var}: invalid JSON: {e}") from e
 
 
+INFERENCE_PROFILE_OPERATIONS = ("default", "retain", "consolidation", "reflect")
+_INFERENCE_PROFILE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+_INFERENCE_PROFILE_ENV_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_INFERENCE_MODEL_FIELDS = frozenset(
+    {
+        "provider",
+        "model",
+        "api_key_env",
+        "base_url",
+        "reasoning_effort",
+        "max_retries",
+        "initial_backoff",
+        "max_backoff",
+        "timeout",
+        "extra_body",
+        "default_headers",
+        "groq_service_tier",
+        "openai_service_tier",
+        "bedrock_service_tier",
+        "gemini_service_tier",
+        "ollama_num_ctx",
+        "litellmrouter_config",
+    }
+)
+_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
+
+
+@dataclass(frozen=True)
+class InferenceModelProfile:
+    """One fully identified model route in a server-owned inference profile."""
+
+    provider: str
+    model: str
+    api_key_env: str | None = None
+    api_key: str | None = field(default=None, repr=False)
+    base_url: str | None = None
+    reasoning_effort: str | None = None
+    max_retries: int | None = None
+    initial_backoff: float | None = None
+    max_backoff: float | None = None
+    timeout: float | None = None
+    extra_body: Mapping[str, Any] | None = None
+    default_headers: Mapping[str, str] | None = None
+    litellmrouter_config: Mapping[str, Any] | None = None
+    groq_service_tier: str | None = None
+    openai_service_tier: str | None = None
+    bedrock_service_tier: str | None = None
+    gemini_service_tier: str | None = None
+    ollama_num_ctx: int | None = None
+
+
+@dataclass(frozen=True)
+class InferenceProfile:
+    """A total set of routes for every Hindsight inference operation."""
+
+    default: InferenceModelProfile
+    retain: InferenceModelProfile
+    consolidation: InferenceModelProfile
+    reflect: InferenceModelProfile
+
+    def route(self, operation: str) -> InferenceModelProfile:
+        if operation not in INFERENCE_PROFILE_OPERATIONS:
+            raise ValueError(f"Unknown inference profile operation {operation!r}")
+        return getattr(self, operation)
+
+
+def _strict_json_object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate field {key!r}")
+        result[key] = value
+    return result
+
+
+def _reject_nonfinite_json_constant(value: str) -> Any:
+    raise ValueError(f"non-finite JSON number {value!r}")
+
+
+def _parse_finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON number {value!r}")
+    return parsed
+
+
+def _freeze_profile_json(value: Any) -> Any:
+    """Recursively freeze a validated JSON payload."""
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"non-finite JSON number {value!r}")
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze_profile_json(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze_profile_json(item) for item in value)
+    return value
+
+
+def _profile_nonempty_string(profile_id: str, operation: str, field_name: str, value: Any) -> str:
+    if not isinstance(value, str) or not value.strip() or value.strip() != value:
+        raise ValueError(
+            f"Inference profile {profile_id!r} operation {operation!r} field {field_name!r} "
+            "must be a non-empty string without surrounding whitespace"
+        )
+    return value
+
+
+def _profile_optional_number(
+    profile_id: str,
+    operation: str,
+    field_name: str,
+    value: Any,
+    *,
+    integer: bool = False,
+    allow_zero: bool = False,
+) -> int | float | None:
+    if value is None:
+        return None
+    expected = int if integer else (int, float)
+    if isinstance(value, bool) or not isinstance(value, expected):
+        kind = "integer" if integer else "number"
+        raise ValueError(
+            f"Inference profile {profile_id!r} operation {operation!r} field {field_name!r} must be a {kind}"
+        )
+    if not math.isfinite(float(value)):
+        raise ValueError(
+            f"Inference profile {profile_id!r} operation {operation!r} field {field_name!r} must be finite"
+        )
+    if value < 0 or (value == 0 and not allow_zero):
+        comparison = "non-negative" if allow_zero else "positive"
+        raise ValueError(
+            f"Inference profile {profile_id!r} operation {operation!r} field {field_name!r} must be {comparison}"
+        )
+    return value
+
+
+def _parse_inference_model_profile(
+    profile_id: str, operation: str, raw: Any, environment: dict[str, str]
+) -> InferenceModelProfile:
+    if not isinstance(raw, dict):
+        raise ValueError(f"Inference profile {profile_id!r} operation {operation!r} must be a JSON object")
+    unknown_fields = set(raw) - _INFERENCE_MODEL_FIELDS
+    if unknown_fields:
+        raise ValueError(
+            f"Inference profile {profile_id!r} operation {operation!r} has unknown fields: {sorted(unknown_fields)}"
+        )
+    missing_fields = {"provider", "model"} - set(raw)
+    if missing_fields:
+        raise ValueError(
+            f"Inference profile {profile_id!r} operation {operation!r} is missing required fields: "
+            f"{sorted(missing_fields)}"
+        )
+
+    provider = _profile_nonempty_string(profile_id, operation, "provider", raw["provider"]).lower()
+    try:
+        get_llm_provider_metadata(provider)
+    except ValueError:
+        raise ValueError(
+            f"Inference profile {profile_id!r} operation {operation!r} has unsupported provider {provider!r}"
+        ) from None
+    model = _profile_nonempty_string(profile_id, operation, "model", raw["model"])
+
+    api_key_env = raw.get("api_key_env")
+    api_key: str | None = None
+    if api_key_env is not None:
+        api_key_env = _profile_nonempty_string(profile_id, operation, "api_key_env", api_key_env)
+        if not _INFERENCE_PROFILE_ENV_PATTERN.fullmatch(api_key_env):
+            raise ValueError(
+                f"Inference profile {profile_id!r} operation {operation!r} has invalid api_key_env {api_key_env!r}"
+            )
+        api_key = environment.get(api_key_env)
+        if not api_key or not api_key.strip():
+            raise ValueError(
+                f"Inference profile {profile_id!r} operation {operation!r} references unresolved "
+                f"credential environment variable {api_key_env!r}"
+            )
+
+    if requires_api_key(provider) and api_key is None:
+        raise ValueError(
+            f"Inference profile {profile_id!r} operation {operation!r} provider {provider!r} requires api_key_env"
+        )
+
+    base_url = raw.get("base_url")
+    if base_url is not None:
+        base_url = _profile_nonempty_string(profile_id, operation, "base_url", base_url)
+
+    reasoning_effort = raw.get("reasoning_effort")
+    if reasoning_effort is not None:
+        reasoning_effort = _profile_nonempty_string(profile_id, operation, "reasoning_effort", reasoning_effort).lower()
+        if reasoning_effort not in _REASONING_EFFORTS:
+            raise ValueError(
+                f"Inference profile {profile_id!r} operation {operation!r} has unsupported "
+                f"reasoning_effort {reasoning_effort!r}"
+            )
+
+    extra_body = raw.get("extra_body")
+    if extra_body is not None and not isinstance(extra_body, dict):
+        raise ValueError(
+            f"Inference profile {profile_id!r} operation {operation!r} field 'extra_body' must be a JSON object"
+        )
+    default_headers = raw.get("default_headers")
+    if default_headers is not None and (
+        not isinstance(default_headers, dict)
+        or not all(isinstance(key, str) and key and isinstance(value, str) for key, value in default_headers.items())
+    ):
+        raise ValueError(
+            f"Inference profile {profile_id!r} operation {operation!r} field 'default_headers' "
+            "must be an object of non-empty string keys to string values"
+        )
+
+    litellmrouter_config = raw.get("litellmrouter_config")
+    if litellmrouter_config is not None and not isinstance(litellmrouter_config, dict):
+        raise ValueError(
+            f"Inference profile {profile_id!r} operation {operation!r} field "
+            "'litellmrouter_config' must be a JSON object"
+        )
+    if provider == "litellmrouter" and not litellmrouter_config:
+        raise ValueError(
+            f"Inference profile {profile_id!r} operation {operation!r} provider "
+            "'litellmrouter' requires a non-empty litellmrouter_config"
+        )
+    if provider != "litellmrouter" and litellmrouter_config is not None:
+        raise ValueError(
+            f"Inference profile {profile_id!r} operation {operation!r} field "
+            f"'litellmrouter_config' is unsupported for provider {provider!r}"
+        )
+
+    service_tiers = {
+        "groq_service_tier": ("groq", frozenset({"on_demand", "flex", "auto"})),
+        "openai_service_tier": ("openai", frozenset({"flex"})),
+        "bedrock_service_tier": ("bedrock", frozenset({"flex", "priority", "reserved"})),
+        "gemini_service_tier": ("gemini", frozenset({"flex"})),
+    }
+    parsed_tiers: dict[str, str | None] = {}
+    for field_name, (supported_provider, allowed_values) in service_tiers.items():
+        value = raw.get(field_name)
+        if value is not None:
+            value = _profile_nonempty_string(profile_id, operation, field_name, value).lower()
+            if provider != supported_provider or value not in allowed_values:
+                raise ValueError(
+                    f"Inference profile {profile_id!r} operation {operation!r} has unsupported "
+                    f"{field_name} value {value!r} for provider {provider!r}"
+                )
+        parsed_tiers[field_name] = value
+
+    max_retries = _profile_optional_number(
+        profile_id, operation, "max_retries", raw.get("max_retries"), integer=True, allow_zero=True
+    )
+    initial_backoff = _profile_optional_number(
+        profile_id, operation, "initial_backoff", raw.get("initial_backoff"), allow_zero=True
+    )
+    max_backoff = _profile_optional_number(
+        profile_id, operation, "max_backoff", raw.get("max_backoff"), allow_zero=True
+    )
+    if initial_backoff is not None and max_backoff is not None and initial_backoff > max_backoff:
+        raise ValueError(
+            f"Inference profile {profile_id!r} operation {operation!r} initial_backoff must not exceed max_backoff"
+        )
+    ollama_num_ctx = cast(
+        int | None,
+        _profile_optional_number(profile_id, operation, "ollama_num_ctx", raw.get("ollama_num_ctx"), integer=True),
+    )
+    if ollama_num_ctx is not None and provider not in {"ollama", "ollama-cloud"}:
+        raise ValueError(
+            f"Inference profile {profile_id!r} operation {operation!r} field 'ollama_num_ctx' "
+            f"is unsupported for provider {provider!r}"
+        )
+
+    return InferenceModelProfile(
+        provider=provider,
+        model=model,
+        api_key_env=api_key_env,
+        api_key=api_key,
+        base_url=base_url,
+        reasoning_effort=reasoning_effort,
+        max_retries=cast(int | None, max_retries),
+        initial_backoff=initial_backoff,
+        max_backoff=max_backoff,
+        timeout=_profile_optional_number(profile_id, operation, "timeout", raw.get("timeout")),
+        extra_body=_freeze_profile_json(extra_body) if extra_body is not None else None,
+        default_headers=_freeze_profile_json(default_headers) if default_headers is not None else None,
+        litellmrouter_config=(_freeze_profile_json(litellmrouter_config) if litellmrouter_config is not None else None),
+        groq_service_tier=parsed_tiers["groq_service_tier"],
+        openai_service_tier=parsed_tiers["openai_service_tier"],
+        bedrock_service_tier=parsed_tiers["bedrock_service_tier"],
+        gemini_service_tier=parsed_tiers["gemini_service_tier"],
+        ollama_num_ctx=ollama_num_ctx,
+    )
+
+
+def load_inference_profiles(
+    file_name: str | None, environment: dict[str, str] | None = None
+) -> Mapping[str, InferenceProfile]:
+    """Load and strictly validate the static named inference-profile registry."""
+    if not file_name:
+        return MappingProxyType({})
+    profile_path = Path(file_name).expanduser()
+    try:
+        raw_text = profile_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"Invalid {ENV_INFERENCE_PROFILES_FILE} {file_name!r}: {exc}") from exc
+    try:
+        parsed = json.loads(
+            raw_text,
+            object_pairs_hook=_strict_json_object_pairs,
+            parse_constant=_reject_nonfinite_json_constant,
+            parse_float=_parse_finite_json_float,
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"Invalid {ENV_INFERENCE_PROFILES_FILE} {file_name!r}: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Invalid {ENV_INFERENCE_PROFILES_FILE}: root must be a JSON object")
+
+    environment = dict(os.environ) if environment is None else environment
+    profiles: dict[str, InferenceProfile] = {}
+    required_operations = set(INFERENCE_PROFILE_OPERATIONS)
+    for profile_id, raw_profile in parsed.items():
+        if not isinstance(profile_id, str) or not _INFERENCE_PROFILE_ID_PATTERN.fullmatch(profile_id):
+            raise ValueError(
+                f"Invalid inference profile id {profile_id!r}: expected lowercase letters, digits, or hyphens"
+            )
+        if not isinstance(raw_profile, dict):
+            raise ValueError(f"Inference profile {profile_id!r} must be a JSON object")
+        operation_keys = set(raw_profile)
+        missing_operations = required_operations - operation_keys
+        unknown_operations = operation_keys - required_operations
+        if missing_operations or unknown_operations:
+            details = []
+            if missing_operations:
+                details.append(f"missing operations {sorted(missing_operations)}")
+            if unknown_operations:
+                details.append(f"unknown operations {sorted(unknown_operations)}")
+            raise ValueError(f"Inference profile {profile_id!r} has " + " and ".join(details))
+        routes = {
+            operation: _parse_inference_model_profile(profile_id, operation, raw_profile[operation], environment)
+            for operation in INFERENCE_PROFILE_OPERATIONS
+        }
+        profiles[profile_id] = InferenceProfile(**routes)
+    return MappingProxyType(profiles)
+
+
+def validate_inference_profile_selector(
+    selector: Any,
+    profiles: Mapping[str, InferenceProfile],
+    *,
+    source: str = "inference_profile",
+) -> str | None:
+    """Validate a global, tenant, or bank selector against the static registry."""
+    if selector is None:
+        return None
+    if not isinstance(selector, str) or not _INFERENCE_PROFILE_ID_PATTERN.fullmatch(selector):
+        raise ValueError(f"Invalid {source} selector {selector!r}")
+    if selector not in profiles:
+        raise ValueError(f"Unknown {source} selector {selector!r}")
+    return selector
+
+
 @dataclass
 class LLMMemberConfig:
     """One extra LLM in a multi-LLM chain, configured via indexed env vars.
@@ -1972,7 +2341,7 @@ def _parse_llm_members(prefix: str) -> list[LLMMemberConfig]:
             LLMMemberConfig(
                 provider=provider,
                 api_key=api_key,
-                model=os.getenv(base + "MODEL") or _get_default_model_for_provider(provider),
+                model=os.getenv(base + "MODEL") or get_default_model_for_provider(provider),
                 base_url=os.getenv(base + "BASE_URL") or None,
                 reasoning_effort=os.getenv(base + "REASONING_EFFORT") or None,
                 extra_body=json.loads(os.getenv(base + "EXTRA_BODY", "null")),
@@ -2805,6 +3174,10 @@ class HindsightConfig:
     bm25_max_query_terms: int = DEFAULT_BM25_MAX_QUERY_TERMS
     bm25_selective_terms: bool = DEFAULT_BM25_SELECTIVE_TERMS
 
+    # Static registry plus bank-selectable identifier. Route secrets remain in the registry.
+    inference_profile: str | None = None
+    inference_profiles: Mapping[str, InferenceProfile] = field(default_factory=lambda: MappingProxyType({}))
+
     # Webhook SSRF hardening (static, server-level only — deliberately NOT
     # per-bank configurable: a tenant must not be able to re-open the private
     # ranges or turn response-body exfiltration back on for itself).
@@ -2846,6 +3219,8 @@ class HindsightConfig:
         "consolidation_llm_members",
         # Reranker failover chain — members embed api_keys and base_urls
         "reranker_members",
+        # Named profile routes contain resolved API keys and private endpoints.
+        "inference_profiles",
         # Base URLs (could expose infrastructure)
         "llm_base_url",
         "retain_llm_base_url",
@@ -2881,6 +3256,8 @@ class HindsightConfig:
     # These fields are manually tagged as safe to expose and modify.
     # Excludes credentials, infrastructure config, provider/model selection, and performance tuning.
     _CONFIGURABLE_FIELDS = {
+        # Selects one server-owned inference profile; route contents remain static.
+        "inference_profile",
         # MCP tool access control
         "mcp_enabled_tools",
         # Audit logging on/off, per bank. The actions allowlist and retention
@@ -3078,6 +3455,11 @@ class HindsightConfig:
 
     def validate(self) -> None:
         """Validate configuration values and raise errors for invalid combinations."""
+        validate_inference_profile_selector(
+            self.inference_profile,
+            self.inference_profiles,
+            source=ENV_INFERENCE_PROFILE,
+        )
         # Validate vector_extension
         validate_extension(self.vector_extension)
 
@@ -3157,8 +3539,8 @@ class HindsightConfig:
         # Validate gemini_service_tier
         self.llm_gemini_service_tier = parse_gemini_service_tier(self.llm_gemini_service_tier)
 
-        # When LLM provider is "none", force chunks-only mode and disable LLM-dependent features
-        if self.llm_provider == "none":
+        selected_profile = self.inference_profiles.get(self.inference_profile or "")
+        if selected_profile is None and self.llm_provider == "none":
             self.retain_extraction_mode = "chunks"
             self.enable_observations = False
             logger.info(
@@ -3173,16 +3555,26 @@ class HindsightConfig:
             retain_structured_chunk_size_name="HINDSIGHT_API_RETAIN_STRUCTURED_CHUNK_SIZE",
         )
 
-        validate_retain_completion_token_budget(
-            llm_provider=self.llm_provider,
-            retain_max_completion_tokens=self.retain_max_completion_tokens,
-            retain_chunk_size=self.retain_chunk_size,
-            retain_llm_model=self.retain_llm_model,
-            llm_model=self.llm_model,
-            retain_llm_provider=self.retain_llm_provider,
-            retain_max_completion_tokens_name="HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS",
-            retain_chunk_size_name="HINDSIGHT_API_RETAIN_CHUNK_SIZE",
-        )
+        if selected_profile is not None:
+            validate_retain_completion_token_budget(
+                llm_provider=selected_profile.retain.provider,
+                retain_max_completion_tokens=self.retain_max_completion_tokens,
+                retain_chunk_size=self.retain_chunk_size,
+                llm_model=selected_profile.retain.model,
+                retain_max_completion_tokens_name="HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS",
+                retain_chunk_size_name="HINDSIGHT_API_RETAIN_CHUNK_SIZE",
+            )
+        else:
+            validate_retain_completion_token_budget(
+                llm_provider=self.llm_provider,
+                retain_max_completion_tokens=self.retain_max_completion_tokens,
+                retain_chunk_size=self.retain_chunk_size,
+                retain_llm_model=self.retain_llm_model,
+                llm_model=self.llm_model,
+                retain_llm_provider=self.retain_llm_provider,
+                retain_max_completion_tokens_name="HINDSIGHT_API_RETAIN_MAX_COMPLETION_TOKENS",
+                retain_chunk_size_name="HINDSIGHT_API_RETAIN_CHUNK_SIZE",
+            )
 
         # Warn if local ML dependencies are missing when configured.
         # Don't hard-fail here — the actual ImportError fires at model init time
@@ -3243,9 +3635,20 @@ class HindsightConfig:
     @classmethod
     def from_env(cls) -> "HindsightConfig":
         """Create configuration from environment variables."""
-        # Get provider first to determine default model
-        llm_provider = os.getenv(ENV_LLM_PROVIDER, DEFAULT_LLM_PROVIDER)
-        llm_model = os.getenv(ENV_LLM_MODEL) or _get_default_model_for_provider(llm_provider)
+        inference_profiles = load_inference_profiles(os.getenv(ENV_INFERENCE_PROFILES_FILE))
+        inference_profile = validate_inference_profile_selector(
+            os.getenv(ENV_INFERENCE_PROFILE) or None,
+            inference_profiles,
+            source=ENV_INFERENCE_PROFILE,
+        )
+        legacy_routing = inference_profile is None
+        llm_provider = os.getenv(ENV_LLM_PROVIDER, DEFAULT_LLM_PROVIDER) if legacy_routing else "none"
+        llm_model = (
+            os.getenv(ENV_LLM_MODEL) or get_default_model_for_provider(llm_provider) if legacy_routing else "none"
+        )
+        retain_llm_provider = os.getenv(ENV_RETAIN_LLM_PROVIDER) or None if legacy_routing else None
+        reflect_llm_provider = os.getenv(ENV_REFLECT_LLM_PROVIDER) or None if legacy_routing else None
+        consolidation_llm_provider = os.getenv(ENV_CONSOLIDATION_LLM_PROVIDER) or None if legacy_routing else None
 
         # Parse per-type worker slot reservations (floors) once.
         worker_slot_reservations = _parse_worker_slot_reservations()
@@ -3281,26 +3684,46 @@ class HindsightConfig:
             llm_output_language=(os.getenv(ENV_LLM_OUTPUT_LANGUAGE) or None),
             # LLM
             llm_provider=llm_provider,
-            llm_api_key=os.getenv(ENV_LLM_API_KEY),
+            llm_api_key=os.getenv(ENV_LLM_API_KEY) if legacy_routing else None,
             llm_model=llm_model,
-            llm_base_url=os.getenv(ENV_LLM_BASE_URL) or None,
-            llm_max_concurrent=int(os.getenv(ENV_LLM_MAX_CONCURRENT, str(DEFAULT_LLM_MAX_CONCURRENT))),
-            llm_max_retries=int(os.getenv(ENV_LLM_MAX_RETRIES, str(DEFAULT_LLM_MAX_RETRIES))),
-            llm_initial_backoff=float(os.getenv(ENV_LLM_INITIAL_BACKOFF, str(DEFAULT_LLM_INITIAL_BACKOFF))),
-            llm_max_backoff=float(os.getenv(ENV_LLM_MAX_BACKOFF, str(DEFAULT_LLM_MAX_BACKOFF))),
-            llm_timeout=float(os.getenv(ENV_LLM_TIMEOUT, str(DEFAULT_LLM_TIMEOUT))),
-            llm_reasoning_effort=os.getenv(ENV_LLM_REASONING_EFFORT) or None,
+            llm_base_url=os.getenv(ENV_LLM_BASE_URL) or None if legacy_routing else None,
+            llm_max_concurrent=(
+                int(os.getenv(ENV_LLM_MAX_CONCURRENT, str(DEFAULT_LLM_MAX_CONCURRENT)))
+                if legacy_routing
+                else DEFAULT_LLM_MAX_CONCURRENT
+            ),
+            llm_max_retries=(
+                int(os.getenv(ENV_LLM_MAX_RETRIES, str(DEFAULT_LLM_MAX_RETRIES)))
+                if legacy_routing
+                else DEFAULT_LLM_MAX_RETRIES
+            ),
+            llm_initial_backoff=(
+                float(os.getenv(ENV_LLM_INITIAL_BACKOFF, str(DEFAULT_LLM_INITIAL_BACKOFF)))
+                if legacy_routing
+                else DEFAULT_LLM_INITIAL_BACKOFF
+            ),
+            llm_max_backoff=(
+                float(os.getenv(ENV_LLM_MAX_BACKOFF, str(DEFAULT_LLM_MAX_BACKOFF)))
+                if legacy_routing
+                else DEFAULT_LLM_MAX_BACKOFF
+            ),
+            llm_timeout=(
+                float(os.getenv(ENV_LLM_TIMEOUT, str(DEFAULT_LLM_TIMEOUT))) if legacy_routing else DEFAULT_LLM_TIMEOUT
+            ),
+            llm_reasoning_effort=os.getenv(ENV_LLM_REASONING_EFFORT) or None if legacy_routing else None,
             llm_groq_service_tier=os.getenv(ENV_LLM_GROQ_SERVICE_TIER, DEFAULT_LLM_GROQ_SERVICE_TIER),
             llm_openai_service_tier=os.getenv(ENV_LLM_OPENAI_SERVICE_TIER, DEFAULT_LLM_OPENAI_SERVICE_TIER),
             llm_bedrock_service_tier=os.getenv(ENV_LLM_BEDROCK_SERVICE_TIER) or None,
             llm_gemini_service_tier=(
                 parse_gemini_service_tier(os.getenv(ENV_LLM_GEMINI_SERVICE_TIER) or DEFAULT_LLM_GEMINI_SERVICE_TIER)
-                if llm_provider.lower() == "gemini"
-                else None
+                if legacy_routing and llm_provider.lower() == "gemini"
+                else DEFAULT_LLM_GEMINI_SERVICE_TIER
             ),
-            llm_extra_body=json.loads(os.getenv(ENV_LLM_EXTRA_BODY, "null")),
-            llm_default_headers=json.loads(os.getenv(ENV_LLM_DEFAULT_HEADERS, "null")),
-            llm_cache_affinity=os.getenv(ENV_LLM_CACHE_AFFINITY, DEFAULT_LLM_CACHE_AFFINITY) or None,
+            llm_extra_body=(json.loads(os.getenv(ENV_LLM_EXTRA_BODY, "null")) if legacy_routing else None),
+            llm_default_headers=(json.loads(os.getenv(ENV_LLM_DEFAULT_HEADERS, "null")) if legacy_routing else None),
+            llm_cache_affinity=(
+                os.getenv(ENV_LLM_CACHE_AFFINITY, DEFAULT_LLM_CACHE_AFFINITY) or None if legacy_routing else None
+            ),
             llm_strict_schema=os.getenv(ENV_LLM_STRICT_SCHEMA, str(DEFAULT_LLM_STRICT_SCHEMA)).lower() in ("true", "1"),
             llm_strict_schema_retain=_resolve_operation_strict_schema(ENV_LLM_STRICT_SCHEMA_RETAIN),
             llm_strict_schema_reflect=_resolve_operation_strict_schema(ENV_LLM_STRICT_SCHEMA_REFLECT),
@@ -3315,9 +3738,13 @@ class HindsightConfig:
             ),
             llm_send_bank_as_user=os.getenv(ENV_LLM_SEND_BANK_AS_USER, str(DEFAULT_LLM_SEND_BANK_AS_USER)).lower()
             in ("true", "1"),
-            llm_ollama_num_ctx=_parse_optional_positive_int(
-                ENV_LLM_OLLAMA_NUM_CTX,
-                os.getenv(ENV_LLM_OLLAMA_NUM_CTX),
+            llm_ollama_num_ctx=(
+                _parse_optional_positive_int(
+                    ENV_LLM_OLLAMA_NUM_CTX,
+                    os.getenv(ENV_LLM_OLLAMA_NUM_CTX),
+                )
+                if legacy_routing
+                else None
             ),
             llm_temperature_verification=_resolve_operation_temperature(
                 ENV_LLM_TEMPERATURE_VERIFICATION, DEFAULT_LLM_TEMPERATURE_VERIFICATION
@@ -3331,7 +3758,9 @@ class HindsightConfig:
             llm_temperature_consolidation=_resolve_operation_temperature(
                 ENV_LLM_TEMPERATURE_CONSOLIDATION, DEFAULT_LLM_TEMPERATURE_CONSOLIDATION
             ),
-            llm_litellmrouter_config=_parse_llm_router_config(ENV_LLM_LITELLMROUTER_CONFIG),
+            llm_litellmrouter_config=(
+                _parse_llm_router_config(ENV_LLM_LITELLMROUTER_CONFIG) if legacy_routing else None
+            ),
             # Vertex AI
             llm_vertexai_project_id=os.getenv(ENV_LLM_VERTEXAI_PROJECT_ID) or DEFAULT_LLM_VERTEXAI_PROJECT_ID,
             llm_vertexai_region=os.getenv(ENV_LLM_VERTEXAI_REGION, DEFAULT_LLM_VERTEXAI_REGION),
@@ -3354,102 +3783,130 @@ class HindsightConfig:
             in ("true", "1"),
             llamacpp_extra_args=os.getenv(ENV_LLAMACPP_EXTRA_ARGS) or DEFAULT_LLAMACPP_EXTRA_ARGS,
             # Per-operation LLM config (None = use default)
-            retain_llm_provider=os.getenv(ENV_RETAIN_LLM_PROVIDER) or None,
-            retain_llm_api_key=os.getenv(ENV_RETAIN_LLM_API_KEY) or None,
-            retain_llm_model=os.getenv(ENV_RETAIN_LLM_MODEL)
-            or (
-                _get_default_model_for_provider(os.getenv(ENV_RETAIN_LLM_PROVIDER))
-                if os.getenv(ENV_RETAIN_LLM_PROVIDER)
+            retain_llm_provider=retain_llm_provider,
+            retain_llm_api_key=os.getenv(ENV_RETAIN_LLM_API_KEY) or None if legacy_routing else None,
+            retain_llm_model=(
+                os.getenv(ENV_RETAIN_LLM_MODEL)
+                or (get_default_model_for_provider(retain_llm_provider) if retain_llm_provider else None)
+                if legacy_routing
                 else None
             ),
-            retain_llm_base_url=os.getenv(ENV_RETAIN_LLM_BASE_URL) or None,
+            retain_llm_base_url=os.getenv(ENV_RETAIN_LLM_BASE_URL) or None if legacy_routing else None,
             fireworks_account_id=os.getenv(ENV_FIREWORKS_ACCOUNT_ID) or None,
             fireworks_batch_base_url=os.getenv(ENV_FIREWORKS_BATCH_BASE_URL) or DEFAULT_FIREWORKS_BATCH_BASE_URL,
             fireworks_batch_max_wait_seconds=int(
                 os.getenv(ENV_FIREWORKS_BATCH_MAX_WAIT_SECONDS, str(DEFAULT_FIREWORKS_BATCH_MAX_WAIT_SECONDS))
             ),
-            retain_llm_max_concurrent=int(os.getenv(ENV_RETAIN_LLM_MAX_CONCURRENT))
-            if os.getenv(ENV_RETAIN_LLM_MAX_CONCURRENT)
-            else None,
-            retain_llm_max_retries=int(os.getenv(ENV_RETAIN_LLM_MAX_RETRIES))
-            if os.getenv(ENV_RETAIN_LLM_MAX_RETRIES)
-            else None,
-            retain_llm_initial_backoff=float(os.getenv(ENV_RETAIN_LLM_INITIAL_BACKOFF))
-            if os.getenv(ENV_RETAIN_LLM_INITIAL_BACKOFF)
-            else None,
-            retain_llm_max_backoff=float(os.getenv(ENV_RETAIN_LLM_MAX_BACKOFF))
-            if os.getenv(ENV_RETAIN_LLM_MAX_BACKOFF)
-            else None,
-            retain_llm_timeout=float(os.getenv(ENV_RETAIN_LLM_TIMEOUT)) if os.getenv(ENV_RETAIN_LLM_TIMEOUT) else None,
-            retain_llm_litellmrouter_config=_parse_llm_router_config(ENV_RETAIN_LLM_LITELLMROUTER_CONFIG),
-            retain_llm_reasoning_effort=os.getenv(ENV_RETAIN_LLM_REASONING_EFFORT) or None,
-            retain_llm_extra_body=json.loads(os.getenv(ENV_RETAIN_LLM_EXTRA_BODY, "null")),
-            retain_llm_cache_affinity=os.getenv(ENV_RETAIN_LLM_CACHE_AFFINITY) or None,
-            reflect_llm_provider=os.getenv(ENV_REFLECT_LLM_PROVIDER) or None,
-            reflect_llm_api_key=os.getenv(ENV_REFLECT_LLM_API_KEY) or None,
-            reflect_llm_model=os.getenv(ENV_REFLECT_LLM_MODEL)
-            or (
-                _get_default_model_for_provider(os.getenv(ENV_REFLECT_LLM_PROVIDER))
-                if os.getenv(ENV_REFLECT_LLM_PROVIDER)
+            retain_llm_max_concurrent=(
+                _parse_optional_int(os.getenv(ENV_RETAIN_LLM_MAX_CONCURRENT)) if legacy_routing else None
+            ),
+            retain_llm_max_retries=(
+                _parse_optional_int(os.getenv(ENV_RETAIN_LLM_MAX_RETRIES)) if legacy_routing else None
+            ),
+            retain_llm_initial_backoff=(
+                _parse_optional_float(os.getenv(ENV_RETAIN_LLM_INITIAL_BACKOFF)) if legacy_routing else None
+            ),
+            retain_llm_max_backoff=(
+                _parse_optional_float(os.getenv(ENV_RETAIN_LLM_MAX_BACKOFF)) if legacy_routing else None
+            ),
+            retain_llm_timeout=(_parse_optional_float(os.getenv(ENV_RETAIN_LLM_TIMEOUT)) if legacy_routing else None),
+            retain_llm_litellmrouter_config=(
+                _parse_llm_router_config(ENV_RETAIN_LLM_LITELLMROUTER_CONFIG) if legacy_routing else None
+            ),
+            retain_llm_reasoning_effort=(
+                os.getenv(ENV_RETAIN_LLM_REASONING_EFFORT) or None if legacy_routing else None
+            ),
+            retain_llm_extra_body=(
+                json.loads(os.getenv(ENV_RETAIN_LLM_EXTRA_BODY, "null")) if legacy_routing else None
+            ),
+            retain_llm_cache_affinity=(os.getenv(ENV_RETAIN_LLM_CACHE_AFFINITY) or None if legacy_routing else None),
+            reflect_llm_provider=reflect_llm_provider,
+            reflect_llm_api_key=os.getenv(ENV_REFLECT_LLM_API_KEY) or None if legacy_routing else None,
+            reflect_llm_model=(
+                os.getenv(ENV_REFLECT_LLM_MODEL)
+                or (get_default_model_for_provider(reflect_llm_provider) if reflect_llm_provider else None)
+                if legacy_routing
                 else None
             ),
-            reflect_llm_base_url=os.getenv(ENV_REFLECT_LLM_BASE_URL) or None,
-            reflect_llm_max_concurrent=int(os.getenv(ENV_REFLECT_LLM_MAX_CONCURRENT))
-            if os.getenv(ENV_REFLECT_LLM_MAX_CONCURRENT)
-            else None,
-            reflect_llm_max_retries=int(os.getenv(ENV_REFLECT_LLM_MAX_RETRIES))
-            if os.getenv(ENV_REFLECT_LLM_MAX_RETRIES)
-            else None,
-            reflect_llm_initial_backoff=float(os.getenv(ENV_REFLECT_LLM_INITIAL_BACKOFF))
-            if os.getenv(ENV_REFLECT_LLM_INITIAL_BACKOFF)
-            else None,
-            reflect_llm_max_backoff=float(os.getenv(ENV_REFLECT_LLM_MAX_BACKOFF))
-            if os.getenv(ENV_REFLECT_LLM_MAX_BACKOFF)
-            else None,
-            reflect_llm_timeout=float(os.getenv(ENV_REFLECT_LLM_TIMEOUT))
-            if os.getenv(ENV_REFLECT_LLM_TIMEOUT)
-            else None,
-            reflect_llm_litellmrouter_config=_parse_llm_router_config(ENV_REFLECT_LLM_LITELLMROUTER_CONFIG),
-            reflect_llm_reasoning_effort=os.getenv(ENV_REFLECT_LLM_REASONING_EFFORT) or None,
-            reflect_llm_extra_body=json.loads(os.getenv(ENV_REFLECT_LLM_EXTRA_BODY, "null")),
-            reflect_llm_cache_affinity=os.getenv(ENV_REFLECT_LLM_CACHE_AFFINITY) or None,
-            consolidation_llm_provider=os.getenv(ENV_CONSOLIDATION_LLM_PROVIDER) or None,
-            consolidation_llm_api_key=os.getenv(ENV_CONSOLIDATION_LLM_API_KEY) or None,
-            consolidation_llm_model=os.getenv(ENV_CONSOLIDATION_LLM_MODEL)
-            or (
-                _get_default_model_for_provider(os.getenv(ENV_CONSOLIDATION_LLM_PROVIDER))
-                if os.getenv(ENV_CONSOLIDATION_LLM_PROVIDER)
+            reflect_llm_base_url=os.getenv(ENV_REFLECT_LLM_BASE_URL) or None if legacy_routing else None,
+            reflect_llm_max_concurrent=(
+                _parse_optional_int(os.getenv(ENV_REFLECT_LLM_MAX_CONCURRENT)) if legacy_routing else None
+            ),
+            reflect_llm_max_retries=(
+                _parse_optional_int(os.getenv(ENV_REFLECT_LLM_MAX_RETRIES)) if legacy_routing else None
+            ),
+            reflect_llm_initial_backoff=(
+                _parse_optional_float(os.getenv(ENV_REFLECT_LLM_INITIAL_BACKOFF)) if legacy_routing else None
+            ),
+            reflect_llm_max_backoff=(
+                _parse_optional_float(os.getenv(ENV_REFLECT_LLM_MAX_BACKOFF)) if legacy_routing else None
+            ),
+            reflect_llm_timeout=(_parse_optional_float(os.getenv(ENV_REFLECT_LLM_TIMEOUT)) if legacy_routing else None),
+            reflect_llm_litellmrouter_config=(
+                _parse_llm_router_config(ENV_REFLECT_LLM_LITELLMROUTER_CONFIG) if legacy_routing else None
+            ),
+            reflect_llm_reasoning_effort=(
+                os.getenv(ENV_REFLECT_LLM_REASONING_EFFORT) or None if legacy_routing else None
+            ),
+            reflect_llm_extra_body=(
+                json.loads(os.getenv(ENV_REFLECT_LLM_EXTRA_BODY, "null")) if legacy_routing else None
+            ),
+            reflect_llm_cache_affinity=(os.getenv(ENV_REFLECT_LLM_CACHE_AFFINITY) or None if legacy_routing else None),
+            consolidation_llm_provider=consolidation_llm_provider,
+            consolidation_llm_api_key=(os.getenv(ENV_CONSOLIDATION_LLM_API_KEY) or None if legacy_routing else None),
+            consolidation_llm_model=(
+                os.getenv(ENV_CONSOLIDATION_LLM_MODEL)
+                or (get_default_model_for_provider(consolidation_llm_provider) if consolidation_llm_provider else None)
+                if legacy_routing
                 else None
             ),
-            consolidation_llm_base_url=os.getenv(ENV_CONSOLIDATION_LLM_BASE_URL) or None,
-            consolidation_llm_max_concurrent=int(os.getenv(ENV_CONSOLIDATION_LLM_MAX_CONCURRENT))
-            if os.getenv(ENV_CONSOLIDATION_LLM_MAX_CONCURRENT)
-            else None,
-            consolidation_llm_max_retries=int(os.getenv(ENV_CONSOLIDATION_LLM_MAX_RETRIES))
-            if os.getenv(ENV_CONSOLIDATION_LLM_MAX_RETRIES)
-            else None,
-            consolidation_llm_initial_backoff=float(os.getenv(ENV_CONSOLIDATION_LLM_INITIAL_BACKOFF))
-            if os.getenv(ENV_CONSOLIDATION_LLM_INITIAL_BACKOFF)
-            else None,
-            consolidation_llm_max_backoff=float(os.getenv(ENV_CONSOLIDATION_LLM_MAX_BACKOFF))
-            if os.getenv(ENV_CONSOLIDATION_LLM_MAX_BACKOFF)
-            else None,
-            consolidation_llm_timeout=float(os.getenv(ENV_CONSOLIDATION_LLM_TIMEOUT))
-            if os.getenv(ENV_CONSOLIDATION_LLM_TIMEOUT)
-            else None,
-            consolidation_llm_litellmrouter_config=_parse_llm_router_config(ENV_CONSOLIDATION_LLM_LITELLMROUTER_CONFIG),
-            consolidation_llm_reasoning_effort=os.getenv(ENV_CONSOLIDATION_LLM_REASONING_EFFORT) or None,
-            consolidation_llm_extra_body=json.loads(os.getenv(ENV_CONSOLIDATION_LLM_EXTRA_BODY, "null")),
-            consolidation_llm_cache_affinity=os.getenv(ENV_CONSOLIDATION_LLM_CACHE_AFFINITY) or None,
-            # Multi-LLM chains (indexed members + routing strategy)
-            llm_members=_parse_llm_members(""),
-            llm_strategy=_parse_llm_strategy(os.getenv(ENV_LLM_STRATEGY)),
-            retain_llm_members=_parse_llm_members("RETAIN_"),
-            retain_llm_strategy=_parse_llm_strategy(os.getenv(ENV_RETAIN_LLM_STRATEGY)),
-            reflect_llm_members=_parse_llm_members("REFLECT_"),
-            reflect_llm_strategy=_parse_llm_strategy(os.getenv(ENV_REFLECT_LLM_STRATEGY)),
-            consolidation_llm_members=_parse_llm_members("CONSOLIDATION_"),
-            consolidation_llm_strategy=_parse_llm_strategy(os.getenv(ENV_CONSOLIDATION_LLM_STRATEGY)),
+            consolidation_llm_base_url=(os.getenv(ENV_CONSOLIDATION_LLM_BASE_URL) or None if legacy_routing else None),
+            consolidation_llm_max_concurrent=(
+                _parse_optional_int(os.getenv(ENV_CONSOLIDATION_LLM_MAX_CONCURRENT)) if legacy_routing else None
+            ),
+            consolidation_llm_max_retries=(
+                _parse_optional_int(os.getenv(ENV_CONSOLIDATION_LLM_MAX_RETRIES)) if legacy_routing else None
+            ),
+            consolidation_llm_initial_backoff=(
+                _parse_optional_float(os.getenv(ENV_CONSOLIDATION_LLM_INITIAL_BACKOFF)) if legacy_routing else None
+            ),
+            consolidation_llm_max_backoff=(
+                _parse_optional_float(os.getenv(ENV_CONSOLIDATION_LLM_MAX_BACKOFF)) if legacy_routing else None
+            ),
+            consolidation_llm_timeout=(
+                _parse_optional_float(os.getenv(ENV_CONSOLIDATION_LLM_TIMEOUT)) if legacy_routing else None
+            ),
+            consolidation_llm_litellmrouter_config=(
+                _parse_llm_router_config(ENV_CONSOLIDATION_LLM_LITELLMROUTER_CONFIG) if legacy_routing else None
+            ),
+            consolidation_llm_reasoning_effort=(
+                os.getenv(ENV_CONSOLIDATION_LLM_REASONING_EFFORT) or None if legacy_routing else None
+            ),
+            consolidation_llm_extra_body=(
+                json.loads(os.getenv(ENV_CONSOLIDATION_LLM_EXTRA_BODY, "null")) if legacy_routing else None
+            ),
+            consolidation_llm_cache_affinity=(
+                os.getenv(ENV_CONSOLIDATION_LLM_CACHE_AFFINITY) or None if legacy_routing else None
+            ),
+            # A selected named profile owns all four routes and never inherits legacy chains.
+            llm_members=[] if inference_profile is not None else _parse_llm_members(""),
+            llm_strategy=None if inference_profile is not None else _parse_llm_strategy(os.getenv(ENV_LLM_STRATEGY)),
+            retain_llm_members=[] if inference_profile is not None else _parse_llm_members("RETAIN_"),
+            retain_llm_strategy=(
+                None if inference_profile is not None else _parse_llm_strategy(os.getenv(ENV_RETAIN_LLM_STRATEGY))
+            ),
+            reflect_llm_members=[] if inference_profile is not None else _parse_llm_members("REFLECT_"),
+            reflect_llm_strategy=(
+                None if inference_profile is not None else _parse_llm_strategy(os.getenv(ENV_REFLECT_LLM_STRATEGY))
+            ),
+            consolidation_llm_members=([] if inference_profile is not None else _parse_llm_members("CONSOLIDATION_")),
+            consolidation_llm_strategy=(
+                None
+                if inference_profile is not None
+                else _parse_llm_strategy(os.getenv(ENV_CONSOLIDATION_LLM_STRATEGY))
+            ),
+            inference_profile=inference_profile,
+            inference_profiles=inference_profiles,
             # Embeddings
             embeddings_provider=os.getenv(ENV_EMBEDDINGS_PROVIDER, DEFAULT_EMBEDDINGS_PROVIDER),
             # Generic name, falling back to the deprecated LiteLLM-SDK-specific alias.
@@ -4215,17 +4672,7 @@ class HindsightConfig:
         if self.llm_base_url:
             return self.llm_base_url
 
-        provider = self.llm_provider.lower()
-        if provider == "groq":
-            return "https://api.groq.com/openai/v1"
-        elif provider == "ollama":
-            return "http://localhost:11434/v1"
-        elif provider == "ollama-cloud":
-            return "https://ollama.com/v1"
-        elif provider == "lmstudio":
-            return "http://localhost:1234/v1"
-        else:
-            return ""
+        return get_llm_provider_metadata(self.llm_provider).default_base_url
 
     def get_python_log_level(self) -> int:
         """Get the Python logging level from the configured log level string."""
@@ -4274,19 +4721,27 @@ class HindsightConfig:
             logger.info(f"Read database (recall queries only): {mask_network_location(self.read_database_url)}")
         if self.migration_database_url:
             logger.info(f"Migration database: {mask_network_location(self.migration_database_url)}")
-        logger.info(f"LLM: provider={self.llm_provider}, model={self.llm_model}")
-        if self.retain_llm_provider or self.retain_llm_model:
-            retain_provider = self.retain_llm_provider or self.llm_provider
-            retain_model = self.retain_llm_model or self.llm_model
-            logger.info(f"LLM (retain): provider={retain_provider}, model={retain_model}")
-        if self.reflect_llm_provider or self.reflect_llm_model:
-            reflect_provider = self.reflect_llm_provider or self.llm_provider
-            reflect_model = self.reflect_llm_model or self.llm_model
-            logger.info(f"LLM (reflect): provider={reflect_provider}, model={reflect_model}")
-        if self.consolidation_llm_provider or self.consolidation_llm_model:
-            consolidation_provider = self.consolidation_llm_provider or self.llm_provider
-            consolidation_model = self.consolidation_llm_model or self.llm_model
-            logger.info(f"LLM (consolidation): provider={consolidation_provider}, model={consolidation_model}")
+        if self.inference_profile:
+            profile = self.inference_profiles[self.inference_profile]
+            routes = ", ".join(
+                f"{operation}={profile.route(operation).provider}/{profile.route(operation).model}"
+                for operation in INFERENCE_PROFILE_OPERATIONS
+            )
+            logger.info("Inference profile: %s (%s)", self.inference_profile, routes)
+        else:
+            logger.info(f"LLM: provider={self.llm_provider}, model={self.llm_model}")
+            if self.retain_llm_provider or self.retain_llm_model:
+                retain_provider = self.retain_llm_provider or self.llm_provider
+                retain_model = self.retain_llm_model or self.llm_model
+                logger.info(f"LLM (retain): provider={retain_provider}, model={retain_model}")
+            if self.reflect_llm_provider or self.reflect_llm_model:
+                reflect_provider = self.reflect_llm_provider or self.llm_provider
+                reflect_model = self.reflect_llm_model or self.llm_model
+                logger.info(f"LLM (reflect): provider={reflect_provider}, model={reflect_model}")
+            if self.consolidation_llm_provider or self.consolidation_llm_model:
+                consolidation_provider = self.consolidation_llm_provider or self.llm_provider
+                consolidation_model = self.consolidation_llm_model or self.llm_model
+                logger.info(f"LLM (consolidation): provider={consolidation_provider}, model={consolidation_model}")
         logger.info(f"Embeddings: provider={self.embeddings_provider}")
         logger.info(f"Reranker: provider={self.reranker_provider}")
         logger.info(f"Graph retriever: {self.graph_retriever}")

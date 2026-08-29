@@ -86,6 +86,34 @@ Configure via environment variables:
 | `HINDSIGHT_API_HOST` | Server bind address | `0.0.0.0` |
 | `HINDSIGHT_API_PORT` | Server port | `8888` |
 
+### Named inference profiles
+
+Use a server-owned profile registry when one deployment needs a fixed model route for each inference operation:
+
+```json
+{
+  "production": {
+    "default": {"provider": "deepseek", "model": "deepseek-v4-flash", "api_key_env": "DEEPSEEK_API_KEY"},
+    "retain": {"provider": "openai", "model": "retain-model", "api_key_env": "GATEWAY_API_KEY"},
+    "consolidation": {"provider": "openai", "model": "consolidation-model", "api_key_env": "GATEWAY_API_KEY"},
+    "reflect": {"provider": "anthropic", "model": "reflect-model", "api_key_env": "GATEWAY_API_KEY"}
+  }
+}
+```
+
+Set `HINDSIGHT_API_INFERENCE_PROFILES_FILE` to the registry path and
+`HINDSIGHT_API_INFERENCE_PROFILE` to the deployment profile ID. A bank can
+select a registered profile through its `inference_profile` config field. The
+bank stores only the profile ID; route definitions and credentials remain
+server-side. Profile IDs are lowercase identifiers, every profile defines all
+four operations, unknown fields fail startup, and every `api_key_env` reference
+must resolve.
+
+When `HINDSIGHT_API_ENABLE_BANK_LLM_HEALTH=true`, an authenticated
+`POST /v1/default/banks/{bank_id}/health/llm` probes the bank's effective
+retain, consolidation, and reflect routes. The response reports only
+connectivity status and latency.
+
 ### Example with External PostgreSQL
 
 ```bash

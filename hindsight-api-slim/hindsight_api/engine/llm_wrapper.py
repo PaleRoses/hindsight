@@ -385,11 +385,9 @@ def create_llm_provider(
         vertexai_region: Vertex AI region (for VertexAI provider).
         vertexai_credentials: Vertex AI credentials object (for VertexAI provider).
         timeout: Per-request LLM timeout in seconds (resolved by the caller from the
-            per-operation/global config). Threaded into the providers that honour a
-            configurable request timeout (LiteLLM, LiteLLM Router, OpenAI-compatible,
-            Nous). ``None`` lets each provider fall back to its own default
-            (``HINDSIGHT_API_LLM_TIMEOUT`` / ``DEFAULT_LLM_TIMEOUT`` for those four;
-            Anthropic and Gemini keep their provider-specific defaults).
+            per-operation/global config). Threaded into Anthropic, Gemini/VertexAI,
+            LiteLLM, LiteLLM Router, OpenAI-compatible, Fireworks, and Nous providers.
+            ``None`` lets each provider apply its own default.
 
     Returns:
         LLMInterface implementation for the specified provider.
@@ -483,18 +481,23 @@ def create_llm_provider(
             gemini_service_tier=gemini_service_tier,
             prompt_cache_enabled=prompt_cache_enabled,
             extra_body=extra_body,
+            default_headers=default_headers,
+            timeout=timeout,
         )
 
     elif metadata.factory is LLMProviderFactory.ANTHROPIC:
-        return AnthropicLLM(
-            provider=provider,
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
-            reasoning_effort=reasoning_effort,
-            default_headers=default_headers,
-            extra_body=extra_body,
-        )
+        anthropic_kwargs: dict[str, Any] = {
+            "provider": provider,
+            "api_key": api_key,
+            "base_url": base_url,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "default_headers": default_headers,
+            "extra_body": extra_body,
+        }
+        if timeout is not None:
+            anthropic_kwargs["timeout"] = timeout
+        return AnthropicLLM(**anthropic_kwargs)
 
     elif metadata.factory is LLMProviderFactory.LITELLM:
         return LiteLLMLLM(
@@ -578,6 +581,7 @@ def create_llm_provider(
             extra_body=extra_body,
             default_headers=default_headers,
             cache_affinity=cache_affinity,
+            timeout=timeout,
         )
 
     elif metadata.factory is LLMProviderFactory.NOUS:

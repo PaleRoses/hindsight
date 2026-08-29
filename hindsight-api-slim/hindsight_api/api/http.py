@@ -1382,6 +1382,10 @@ class CreateBankRequest(BaseModel):
     )
 
     # Operational configuration (applied via config resolver)
+    inference_profile: str | None = Field(
+        default=None,
+        description="Name of a server-owned inference profile; routes and credentials remain server-side.",
+    )
     retain_mission: str | None = Field(
         default=None,
         description="Steers what gets extracted during retain(). Injected alongside built-in extraction rules.",
@@ -1468,6 +1472,7 @@ class CreateBankRequest(BaseModel):
         elif self.disposition is not None:
             updates["disposition_empathy"] = self.disposition.empathy
         for field_name in (
+            "inference_profile",
             "retain_mission",
             "retain_extraction_mode",
             "retain_custom_instructions",
@@ -2710,6 +2715,10 @@ class BankTemplateConfig(BaseModel):
     (API keys, base URLs) are intentionally excluded for security.
     """
 
+    inference_profile: str | None = Field(
+        default=None,
+        description="Name of a server-owned inference profile; route contents and credentials remain server-side",
+    )
     reflect_mission: str | None = Field(default=None, description="Mission/context for Reflect operations")
     retain_mission: str | None = Field(default=None, description="Steers what gets extracted during retain")
     retain_extraction_mode: str | None = Field(

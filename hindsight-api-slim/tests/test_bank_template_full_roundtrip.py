@@ -39,6 +39,8 @@ costs in production.
 
 from __future__ import annotations
 
+import json
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
@@ -48,8 +50,7 @@ import pytest_asyncio
 
 from hindsight_api.api import create_app
 from hindsight_api.api.http import BankTemplateConfig
-from hindsight_api.config import HindsightConfig
-
+from hindsight_api.config import INFERENCE_PROFILE_OPERATIONS, HindsightConfig, load_inference_profiles
 
 # One value per BankTemplateConfig field, each chosen to differ visibly from the
 # server default so a value that silently reverts is caught rather than matching
@@ -114,6 +115,7 @@ _SAMPLE_VALUES: dict[str, Any] = {
     "enable_auto_consolidation": False,
     "consolidation_max_memories_per_round": 42,
     "consolidation_llm_parallelism": 3,
+    "inference_profile": "template-profile",
     "recall_include_chunks": True,
     "recall_max_tokens": 9000,
     "recall_chunks_max_tokens": 4500,
@@ -125,12 +127,33 @@ _SAMPLE_VALUES: dict[str, Any] = {
 
 
 @pytest_asyncio.fixture
-async def api_client(memory):
+async def api_client(memory, tmp_path, bank_id):
     """In-process ASGI client — matches the fixture in tests/test_bank_templates.py."""
+    registry_path = tmp_path / "inference-profiles.json"
+    registry_path.write_text(
+        json.dumps(
+            {
+                "template-profile": {
+                    operation: {"provider": "mock", "model": f"template-{operation}"}
+                    for operation in INFERENCE_PROFILE_OPERATIONS
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    memory._config_resolver._global_config = replace(
+        memory._config_resolver._global_config,
+        inference_profiles=load_inference_profiles(str(registry_path), environment={}),
+    )
     app = create_app(memory, initialize_memory=False)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        yield client
+        try:
+            yield client
+        finally:
+            for suffix in ("_source", "_clone"):
+                response = await client.delete(f"/v1/default/banks/{bank_id}{suffix}")
+                assert response.status_code in (200, 404), response.text
 
 
 @pytest.fixture
