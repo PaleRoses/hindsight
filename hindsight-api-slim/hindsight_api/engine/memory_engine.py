@@ -1982,17 +1982,6 @@ class MemoryEngine(MemoryEngineInterface):
         else:
             self.db_url = db_url
 
-        # Set default base URL if not provided
-        if memory_llm_base_url is None:
-            if memory_llm_provider.lower() == "groq":
-                memory_llm_base_url = "https://api.groq.com/openai/v1"
-            elif memory_llm_provider.lower() == "ollama":
-                memory_llm_base_url = "http://localhost:11434/v1"
-            elif memory_llm_provider.lower() == "ollama-cloud":
-                memory_llm_base_url = "https://ollama.com/v1"
-            else:
-                memory_llm_base_url = ""
-
         # Database backend and SQL dialect (created during initialize())
         self._database_backend_type = config.database_backend
         self._backend: DatabaseBackend | None = None
