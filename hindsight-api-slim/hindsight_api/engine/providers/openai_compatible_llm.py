@@ -344,18 +344,30 @@ def _content_or_error(response: Any, *, provider: str, model: str, scope: str) -
     return content, choice
 
 
+def _token_count(value: Any) -> int:
+    """Return a non-negative provider token count, treating absent SDK fields as zero."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, str):
+        try:
+            return max(0, int(value))
+        except ValueError:
+            return 0
+    return 0
+
+
 def _usage_from_openai_response(response: Any) -> LLMResponseUsage:
     """Extract prompt/completion/cached token counts from an OpenAI-shaped usage block."""
     usage = getattr(response, "usage", None)
-    input_tokens = (usage.prompt_tokens or 0) if usage else 0
-    output_tokens = (usage.completion_tokens or 0) if usage else 0
-    cached_tokens = 0
-    if usage and getattr(usage, "prompt_tokens_details", None):
-        cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
+    if not usage:
+        return LLMResponseUsage()
+    details = getattr(usage, "prompt_tokens_details", None)
     return LLMResponseUsage(
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        cached_tokens=cached_tokens,
+        input_tokens=_token_count(getattr(usage, "prompt_tokens", 0)),
+        output_tokens=_token_count(getattr(usage, "completion_tokens", 0)),
+        cached_tokens=_token_count(getattr(details, "cached_tokens", 0)),
     )
 
 
@@ -416,6 +428,27 @@ _RATE_LIMIT_WINDOW_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Go's time.Duration.String() format used by OpenAI's x-ratelimit-reset-requests
+# / x-ratelimit-reset-tokens response headers, e.g. "6m0s", "8.64s", "233ms".
+# These are structured, computer-generated values (unlike the free-text error
+# message, which is written for humans and shouldn't be scraped when a
+# proper header is available) but their components run together with no
+# separator, so they must be consumed contiguously from the start or bailed
+# on (a naive single-component match would silently read "6m0s" as "0s").
+_GO_DURATION_RE = re.compile(r"(?P<amount>\d+(?:\.\d+)?)(?P<unit>ms|s|m|h|d)")
+_GO_DURATION_UNIT_SECONDS = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
+
+
+def _parse_go_duration_seconds(text: str) -> float | None:
+    total = 0.0
+    pos = 0
+    for m in _GO_DURATION_RE.finditer(text.strip()):
+        if m.start() != pos:
+            break
+        total += float(m.group("amount")) * _GO_DURATION_UNIT_SECONDS[m.group("unit")]
+        pos = m.end()
+    return total if pos else None
+
 
 def _status_error_body_text(e: APIStatusError) -> str:
     body: Any = getattr(e, "body", None)
@@ -473,34 +506,59 @@ def _parse_reset_at_datetime(value: str) -> datetime | None:
 
 def _rate_limit_retry_at(e: APIStatusError) -> datetime | None:
     now = datetime.now(UTC)
+    retry_candidates: list[datetime] = []
     response = getattr(e, "response", None)
     headers = getattr(response, "headers", None)
+    has_future_retry_after = False
     if headers is not None:
         retry_at = _parse_retry_after_header(headers.get("retry-after") or headers.get("Retry-After"), now)
         if retry_at is not None and retry_at > now:
-            return retry_at
+            retry_candidates.append(retry_at)
+            has_future_retry_after = True
+
+        # Requests, tokens, and longer body-reported quotas are independent
+        # budgets. Collect every future reset so a full/near-full header budget
+        # cannot hide a longer daily or usage-cap window reported in the body.
+        reset_seconds: list[float] = []
+        for key in ("x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"):
+            if key in headers:
+                seconds = _parse_go_duration_seconds(headers[key])
+                if seconds is not None and seconds > 0:
+                    reset_seconds.append(seconds)
+        if reset_seconds:
+            retry_candidates.append(now + timedelta(seconds=max(reset_seconds)))
 
     body_text = _status_error_body_text(e)
+    body_retry_at: datetime | None = None
     reset_match = _RATE_LIMIT_RESET_AT_RE.search(body_text)
     if reset_match:
         retry_at = _parse_reset_at_datetime(reset_match.group("reset_at"))
         if retry_at is not None and retry_at > now:
-            return retry_at
+            body_retry_at = retry_at
 
-    window_match = _RATE_LIMIT_WINDOW_RE.search(body_text)
-    if not window_match:
-        return None
-    amount = int(window_match.group("amount"))
-    unit = window_match.group("unit").lower()
-    if unit == "second":
-        seconds = amount
-    elif unit == "minute":
-        seconds = amount * 60
-    elif unit == "hour":
-        seconds = amount * 3600
-    else:
-        seconds = amount * 86400
-    return now + timedelta(seconds=seconds)
+    if body_retry_at is None:
+        window_match = _RATE_LIMIT_WINDOW_RE.search(body_text)
+        if window_match:
+            amount = int(window_match.group("amount"))
+            unit = window_match.group("unit").lower()
+            if unit == "second":
+                seconds = amount
+            elif unit == "minute":
+                seconds = amount * 60
+            elif unit == "hour":
+                seconds = amount * 3600
+            else:
+                seconds = amount * 86400
+            retry_at = now + timedelta(seconds=seconds)
+            if retry_at > now:
+                body_retry_at = retry_at
+
+    # Retry-After is an explicit server instruction and must not be extended
+    # by a less reliable, free-text error message. Body hints remain useful
+    # alongside reset headers when Retry-After is absent.
+    if body_retry_at is not None and not has_future_retry_after:
+        retry_candidates.append(body_retry_at)
+    return max(retry_candidates, default=None)
 
 
 def _raise_provider_quota_defer(
@@ -1043,11 +1101,11 @@ class OpenAICompatibleLLM(LLMInterface):
                 response_usage = _usage_from_openai_response(response)
                 input_tokens = response_usage.input_tokens
                 output_tokens = response_usage.output_tokens
-                total_tokens = usage.total_tokens or 0 if usage else 0
+                total_tokens = _token_count(getattr(usage, "total_tokens", 0))
                 cached_tokens = response_usage.cached_tokens
                 thoughts_tokens = 0
                 if usage and getattr(usage, "completion_tokens_details", None):
-                    thoughts_tokens = getattr(usage.completion_tokens_details, "reasoning_tokens", 0) or 0
+                    thoughts_tokens = _token_count(getattr(usage.completion_tokens_details, "reasoning_tokens", 0))
                 # OpenAI-compatible providers fold reasoning tokens into
                 # ``completion_tokens`` (and thus ``total_tokens``), but the
                 # TokenUsage contract — and the Gemini provider — treat
@@ -1372,14 +1430,13 @@ class OpenAICompatibleLLM(LLMInterface):
                 # Record metrics
                 duration = time.time() - start_time
                 usage = response.usage
-                input_tokens = usage.prompt_tokens or 0 if usage else 0
-                output_tokens = usage.completion_tokens or 0 if usage else 0
-                cached_tokens = 0
-                if usage and getattr(usage, "prompt_tokens_details", None):
-                    cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
+                response_usage = _usage_from_openai_response(response)
+                input_tokens = response_usage.input_tokens
+                output_tokens = response_usage.output_tokens
+                cached_tokens = response_usage.cached_tokens
                 thoughts_tokens = 0
                 if usage and getattr(usage, "completion_tokens_details", None):
-                    thoughts_tokens = getattr(usage.completion_tokens_details, "reasoning_tokens", 0) or 0
+                    thoughts_tokens = _token_count(getattr(usage.completion_tokens_details, "reasoning_tokens", 0))
                 # See ``call()``: OpenAI-compatible ``completion_tokens`` includes
                 # reasoning, so make ``output_tokens`` visible-only to avoid
                 # double-counting it against ``thoughts_tokens``.

@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "repository": "PaleRoses/hindsight",
+  "repository": "vectorize-io/hindsight",
   "backfilledAt": "2026-08-03T10:36:26.721Z",
   "backfill": [
     {
@@ -1071,23 +1071,23 @@
     },
     {
       "date": "2026-08-25",
-      "stars": 0
+      "stars": 21053
     },
     {
       "date": "2026-08-26",
-      "stars": 0
+      "stars": 21133
     },
     {
       "date": "2026-08-27",
-      "stars": 0
+      "stars": 21376
     },
     {
       "date": "2026-08-28",
-      "stars": 0
+      "stars": 21545
     },
     {
       "date": "2026-08-29",
-      "stars": 0
+      "stars": 21610
     }
   ]
 }
