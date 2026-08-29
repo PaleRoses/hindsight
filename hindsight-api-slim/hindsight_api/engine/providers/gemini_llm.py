@@ -47,11 +47,17 @@ except ImportError:
 
 
 def _to_int(value: Any) -> int:
-    """Coerce Gemini's optional/string completion counts to int, defaulting to 0."""
-    try:
-        return int(value)
-    except (ValueError, TypeError):
+    """Coerce an SDK token count to a non-negative integer."""
+    if isinstance(value, bool):
         return 0
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, str):
+        try:
+            return max(0, int(value))
+        except ValueError:
+            return 0
+    return 0
 
 
 def _usage_from_gemini_response(response: Any) -> LLMResponseUsage:
@@ -60,9 +66,9 @@ def _usage_from_gemini_response(response: Any) -> LLMResponseUsage:
     if not usage:
         return LLMResponseUsage()
     return LLMResponseUsage(
-        input_tokens=usage.prompt_token_count or 0,
-        output_tokens=usage.candidates_token_count or 0,
-        cached_tokens=getattr(usage, "cached_content_token_count", 0) or 0,
+        input_tokens=_to_int(getattr(usage, "prompt_token_count", 0)),
+        output_tokens=_to_int(getattr(usage, "candidates_token_count", 0)),
+        cached_tokens=_to_int(getattr(usage, "cached_content_token_count", 0)),
     )
 
 
@@ -481,10 +487,10 @@ class GeminiLLM(LLMInterface):
                 cached_tokens = 0
                 if hasattr(response, "usage_metadata") and response.usage_metadata:
                     usage = response.usage_metadata
-                    input_tokens = usage.prompt_token_count or 0
-                    output_tokens = usage.candidates_token_count or 0
-                    cached_input_tokens = getattr(usage, "cached_content_token_count", 0) or 0
-                    thoughts_tokens = getattr(usage, "thoughts_token_count", 0) or 0
+                    input_tokens = _to_int(getattr(usage, "prompt_token_count", 0))
+                    output_tokens = _to_int(getattr(usage, "candidates_token_count", 0))
+                    cached_input_tokens = _to_int(getattr(usage, "cached_content_token_count", 0))
+                    thoughts_tokens = _to_int(getattr(usage, "thoughts_token_count", 0))
                     # Tracing/TokenUsage consume ``cached_tokens``; metrics consume
                     # ``cached_input_tokens`` — same value, two downstream names.
                     cached_tokens = cached_input_tokens
@@ -854,10 +860,10 @@ class GeminiLLM(LLMInterface):
                 cached_input_tokens = 0
                 thoughts_tokens = 0
                 if response.usage_metadata:
-                    input_tokens = response.usage_metadata.prompt_token_count or 0
-                    output_tokens = response.usage_metadata.candidates_token_count or 0
-                    cached_input_tokens = getattr(response.usage_metadata, "cached_content_token_count", 0) or 0
-                    thoughts_tokens = getattr(response.usage_metadata, "thoughts_token_count", 0) or 0
+                    input_tokens = _to_int(getattr(response.usage_metadata, "prompt_token_count", 0))
+                    output_tokens = _to_int(getattr(response.usage_metadata, "candidates_token_count", 0))
+                    cached_input_tokens = _to_int(getattr(response.usage_metadata, "cached_content_token_count", 0))
+                    thoughts_tokens = _to_int(getattr(response.usage_metadata, "thoughts_token_count", 0))
 
                 # Record metrics
                 duration = time.time() - start_time

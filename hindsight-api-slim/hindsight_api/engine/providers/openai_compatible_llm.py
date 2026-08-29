@@ -343,18 +343,30 @@ def _content_or_error(response: Any, *, provider: str, model: str, scope: str) -
     return content, choice
 
 
+def _token_count(value: Any) -> int:
+    """Return a non-negative provider token count, treating absent SDK fields as zero."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, str):
+        try:
+            return max(0, int(value))
+        except ValueError:
+            return 0
+    return 0
+
+
 def _usage_from_openai_response(response: Any) -> LLMResponseUsage:
     """Extract prompt/completion/cached token counts from an OpenAI-shaped usage block."""
     usage = getattr(response, "usage", None)
-    input_tokens = (usage.prompt_tokens or 0) if usage else 0
-    output_tokens = (usage.completion_tokens or 0) if usage else 0
-    cached_tokens = 0
-    if usage and getattr(usage, "prompt_tokens_details", None):
-        cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
+    if not usage:
+        return LLMResponseUsage()
+    details = getattr(usage, "prompt_tokens_details", None)
     return LLMResponseUsage(
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        cached_tokens=cached_tokens,
+        input_tokens=_token_count(getattr(usage, "prompt_tokens", 0)),
+        output_tokens=_token_count(getattr(usage, "completion_tokens", 0)),
+        cached_tokens=_token_count(getattr(details, "cached_tokens", 0)),
     )
 
 
@@ -1136,11 +1148,11 @@ class OpenAICompatibleLLM(LLMInterface):
                 response_usage = _usage_from_openai_response(response)
                 input_tokens = response_usage.input_tokens
                 output_tokens = response_usage.output_tokens
-                total_tokens = usage.total_tokens or 0 if usage else 0
+                total_tokens = _token_count(getattr(usage, "total_tokens", 0))
                 cached_tokens = response_usage.cached_tokens
                 thoughts_tokens = 0
                 if usage and getattr(usage, "completion_tokens_details", None):
-                    thoughts_tokens = getattr(usage.completion_tokens_details, "reasoning_tokens", 0) or 0
+                    thoughts_tokens = _token_count(getattr(usage.completion_tokens_details, "reasoning_tokens", 0))
                 # OpenAI-compatible providers fold reasoning tokens into
                 # ``completion_tokens`` (and thus ``total_tokens``), but the
                 # TokenUsage contract — and the Gemini provider — treat
@@ -1461,14 +1473,13 @@ class OpenAICompatibleLLM(LLMInterface):
                 # Record metrics
                 duration = time.time() - start_time
                 usage = response.usage
-                input_tokens = usage.prompt_tokens or 0 if usage else 0
-                output_tokens = usage.completion_tokens or 0 if usage else 0
-                cached_tokens = 0
-                if usage and getattr(usage, "prompt_tokens_details", None):
-                    cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
+                response_usage = _usage_from_openai_response(response)
+                input_tokens = response_usage.input_tokens
+                output_tokens = response_usage.output_tokens
+                cached_tokens = response_usage.cached_tokens
                 thoughts_tokens = 0
                 if usage and getattr(usage, "completion_tokens_details", None):
-                    thoughts_tokens = getattr(usage.completion_tokens_details, "reasoning_tokens", 0) or 0
+                    thoughts_tokens = _token_count(getattr(usage.completion_tokens_details, "reasoning_tokens", 0))
                 # See ``call()``: OpenAI-compatible ``completion_tokens`` includes
                 # reasoning, so make ``output_tokens`` visible-only to avoid
                 # double-counting it against ``thoughts_tokens``.
