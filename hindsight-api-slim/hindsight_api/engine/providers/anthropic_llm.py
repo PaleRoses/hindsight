@@ -89,7 +89,7 @@ class AnthropicLLM(LLMInterface):
         base_url: str,
         model: str,
         reasoning_effort: str | None = None,
-        timeout: float | None = None,
+        timeout: float = 300.0,
         default_headers: dict[str, str] | None = None,
         extra_body: dict[str, Any] | None = None,
         **kwargs: Any,
@@ -102,8 +102,7 @@ class AnthropicLLM(LLMInterface):
             api_key: Anthropic API key.
             base_url: Base URL for the API (optional, uses Anthropic default if empty).
             model: Model name (e.g., "claude-sonnet-4-20250514").
-            reasoning_effort: Effort level mapped onto an extended-thinking token
-                budget (medium/high/xhigh; minimal/low leave thinking off).
+            reasoning_effort: Reasoning effort level (not used by Anthropic).
             timeout: Request timeout in seconds.
             default_headers: Optional custom headers passed as ``default_headers`` to
                 the Anthropic SDK client. Used by operators routing through proxies
@@ -124,19 +123,6 @@ class AnthropicLLM(LLMInterface):
         # User-configured extra body params (merged into every Messages API call)
         self._extra_body = extra_body or {}
 
-        # reasoning_effort → extended-thinking budget. Anthropic exposes no effort
-        # dial; the native control is a token budget. minimal/low leave thinking
-        # off (the pre-thinking behaviour); higher efforts scale the budget.
-        # Applied in `call()` only: the reflect agent loop replays assistant
-        # turns without thinking blocks, which the Messages API rejects when
-        # thinking is enabled together with tool use.
-        self._thinking_budget = {
-            "medium": 8192,
-            "high": 16384,
-            "xhigh": 32768,
-            "max": 32768,
-        }.get((self.reasoning_effort or "").lower(), 0)
-
         # Import and initialize Anthropic client
         try:
             from anthropic import AsyncAnthropic
@@ -144,17 +130,11 @@ class AnthropicLLM(LLMInterface):
             # SDK retries disabled — wrapper-level retry loop in ``call`` handles
             # backoff (mirrors ``OpenAICompatibleLLM`` so the two providers behave
             # consistently).
-            client_kwargs: dict[str, Any] = {
-                "api_key": self.api_key,
-                "max_retries": 0,
-                "timeout": 300.0 if timeout is None else timeout,
-            }
+            client_kwargs: dict[str, Any] = {"api_key": self.api_key, "max_retries": 0}
             if self.base_url:
                 client_kwargs["base_url"] = self.base_url
-                # Operators pointing at a proxy (e.g. omp's auth-gateway) hold a
-                # bearer token, not an Anthropic key. `auth_token` makes the SDK
-                # send it as `Authorization: Bearer` alongside `x-api-key`.
-                client_kwargs["auth_token"] = self.api_key
+            if timeout:
+                client_kwargs["timeout"] = timeout
             if default_headers:
                 client_kwargs["default_headers"] = default_headers
 
@@ -279,14 +259,6 @@ class AnthropicLLM(LLMInterface):
                 {"name": _tool_name, "description": "Return the structured response.", "input_schema": schema}
             ]
             call_params["tool_choice"] = {"type": "tool", "name": _tool_name}
-
-        # Extended thinking, budget set by reasoning_effort (see __init__).
-        # Incompatible with forced tool_use (native constrained decoding) and
-        # wasteful on the startup verification ping. The budget counts toward
-        # max_tokens, so it stacks on top of the visible-output allowance.
-        if self._thinking_budget and not use_forced_tool and scope != "verification":
-            call_params["thinking"] = {"type": "enabled", "budget_tokens": self._thinking_budget}
-            call_params["max_tokens"] += self._thinking_budget
 
         if self._extra_body:
             call_params["extra_body"] = self._extra_body

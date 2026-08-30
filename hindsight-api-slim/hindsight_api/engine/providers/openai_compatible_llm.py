@@ -55,7 +55,6 @@ from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usag
 from hindsight_api.engine.providers.llm_debug import dump_request_on_4xx
 from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
 from hindsight_api.engine.structured_output import strict_json_schema
-from hindsight_api.llm_provider_metadata import OPENAI_COMPATIBLE_PROVIDERS, get_llm_provider_metadata
 from hindsight_api.metrics import get_metrics_collector
 from hindsight_api.worker.stage import set_stage
 
@@ -344,30 +343,18 @@ def _content_or_error(response: Any, *, provider: str, model: str, scope: str) -
     return content, choice
 
 
-def _token_count(value: Any) -> int:
-    """Return a non-negative provider token count, treating absent SDK fields as zero."""
-    if isinstance(value, bool):
-        return 0
-    if isinstance(value, int):
-        return max(0, value)
-    if isinstance(value, str):
-        try:
-            return max(0, int(value))
-        except ValueError:
-            return 0
-    return 0
-
-
 def _usage_from_openai_response(response: Any) -> LLMResponseUsage:
     """Extract prompt/completion/cached token counts from an OpenAI-shaped usage block."""
     usage = getattr(response, "usage", None)
-    if not usage:
-        return LLMResponseUsage()
-    details = getattr(usage, "prompt_tokens_details", None)
+    input_tokens = (usage.prompt_tokens or 0) if usage else 0
+    output_tokens = (usage.completion_tokens or 0) if usage else 0
+    cached_tokens = 0
+    if usage and getattr(usage, "prompt_tokens_details", None):
+        cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
     return LLMResponseUsage(
-        input_tokens=_token_count(getattr(usage, "prompt_tokens", 0)),
-        output_tokens=_token_count(getattr(usage, "completion_tokens", 0)),
-        cached_tokens=_token_count(getattr(details, "cached_tokens", 0)),
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cached_tokens=cached_tokens,
     )
 
 
@@ -625,8 +612,8 @@ class OpenAICompatibleLLM(LLMInterface):
             timeout: Request timeout in seconds (uses env var or 120s default).
             groq_service_tier: Groq service tier ("on_demand", "flex", "auto").
             extra_body: Extra body params merged into every API call.
-            default_headers: Headers supplied to every request by the OpenAI SDK client.
-                None sends no extra headers.
+            default_headers: Custom headers passed to the AsyncOpenAI client (proxies,
+                request-tracing middleware). None sends no extra headers.
             cache_affinity: Backend prompt-cache pinning mode — "none" (default),
                 "xai_conv_id", "openai_prompt_cache_key", or "auto" (resolved once here
                 from the provider + base-URL host). See ``engine/cache_affinity.py``.
@@ -636,30 +623,82 @@ class OpenAICompatibleLLM(LLMInterface):
         """
         super().__init__(provider, api_key, base_url, model, reasoning_effort, **kwargs)
 
-        try:
-            metadata = get_llm_provider_metadata(self.provider)
-        except ValueError:
-            raise ValueError(
-                f"OpenAICompatibleLLM only supports: {', '.join(OPENAI_COMPATIBLE_PROVIDERS)}. Got: {self.provider}"
-            ) from None
-        if not metadata.openai_compatible:
-            raise ValueError(
-                f"OpenAICompatibleLLM only supports: {', '.join(OPENAI_COMPATIBLE_PROVIDERS)}. Got: {self.provider}"
-            )
+        # Validate provider
+        valid_providers = [
+            "openai",
+            "groq",
+            "ollama",
+            "ollama-cloud",
+            "lmstudio",
+            "llamacpp",
+            "minimax",
+            "deepseek",
+            "volcano",
+            "openrouter",
+            "requesty",
+            "zai",
+            "opencode-go",
+            "atlas",
+            "fireworks",
+        ]
+        if self.provider not in valid_providers:
+            raise ValueError(f"OpenAICompatibleLLM only supports: {', '.join(valid_providers)}. Got: {self.provider}")
 
-        self.base_url = self.base_url or metadata.default_base_url
+        # Set default base URLs
+        if not self.base_url:
+            if self.provider == "groq":
+                self.base_url = "https://api.groq.com/openai/v1"
+            elif self.provider == "ollama":
+                self.base_url = "http://localhost:11434/v1"
+            elif self.provider == "ollama-cloud":
+                self.base_url = "https://ollama.com/v1"
+            elif self.provider == "lmstudio":
+                self.base_url = "http://localhost:1234/v1"
+            elif self.provider == "minimax":
+                self.base_url = "https://api.minimax.io/v1"
+            elif self.provider == "deepseek":
+                self.base_url = "https://api.deepseek.com"
+            elif self.provider == "openrouter":
+                self.base_url = "https://openrouter.ai/api/v1"
+            elif self.provider == "requesty":
+                self.base_url = "https://router.requesty.ai/v1"
+            elif self.provider == "zai":
+                self.base_url = "https://api.z.ai/api/coding/paas/v4"
+            elif self.provider == "opencode-go":
+                self.base_url = "https://opencode.ai/zen/go/v1"
+            elif self.provider == "atlas":
+                self.base_url = "https://api.atlascloud.ai/v1"
+            elif self.provider == "fireworks":
+                # OpenAI-compatible inference host (online path). The batch API
+                # lives on a separate control-plane host — see FireworksLLM.
+                self.base_url = "https://api.fireworks.ai/inference/v1"
 
         # Normalize bare local base URLs (e.g. a user pasting the address shown
         # in the LM Studio UI) so the OpenAI SDK targets the `/v1` routes. See #2922.
         if self.provider in _V1_PATH_LOCAL_PROVIDERS and self.base_url:
             self.base_url = _ensure_v1_base_url(self.base_url)
 
-        # The OpenAI SDK requires a non-empty placeholder even for local providers.
-        if not metadata.requires_api_key and not self.api_key:
+        # For ollama/lmstudio, use dummy key if not provided
+        if self.provider in ("ollama", "lmstudio") and not self.api_key:
             self.api_key = "local"
 
-        # Validate API keys from the same provider policy as every other constructor.
-        if metadata.requires_api_key and not self.api_key:
+        # Validate API key for cloud providers
+        if (
+            self.provider
+            in (
+                "openai",
+                "groq",
+                "minimax",
+                "deepseek",
+                "openrouter",
+                "requesty",
+                "zai",
+                "opencode-go",
+                "atlas",
+                "ollama-cloud",
+            )
+            and not self.api_key
+        ):
             raise ValueError(f"API key is required for {self.provider}")
 
         # Service tier configuration (from config, not env vars)
@@ -694,8 +733,6 @@ class OpenAICompatibleLLM(LLMInterface):
                 self.base_url = clean_url
             else:
                 client_kwargs["base_url"] = self.base_url
-        if default_headers:
-            client_kwargs["default_headers"] = default_headers
         if self.timeout:
             client_kwargs["timeout"] = self.timeout
 
@@ -957,8 +994,6 @@ class OpenAICompatibleLLM(LLMInterface):
             # Add reasoning parameters for reasoning models
             if is_reasoning_model:
                 extra_body["include_reasoning"] = False
-        if self.provider == "openai" and self.openai_service_tier:
-            call_params["service_tier"] = self.openai_service_tier
         if extra_body:
             call_params["extra_body"] = extra_body
 
@@ -1101,11 +1136,11 @@ class OpenAICompatibleLLM(LLMInterface):
                 response_usage = _usage_from_openai_response(response)
                 input_tokens = response_usage.input_tokens
                 output_tokens = response_usage.output_tokens
-                total_tokens = _token_count(getattr(usage, "total_tokens", 0))
+                total_tokens = usage.total_tokens or 0 if usage else 0
                 cached_tokens = response_usage.cached_tokens
                 thoughts_tokens = 0
                 if usage and getattr(usage, "completion_tokens_details", None):
-                    thoughts_tokens = _token_count(getattr(usage.completion_tokens_details, "reasoning_tokens", 0))
+                    thoughts_tokens = getattr(usage.completion_tokens_details, "reasoning_tokens", 0) or 0
                 # OpenAI-compatible providers fold reasoning tokens into
                 # ``completion_tokens`` (and thus ``total_tokens``), but the
                 # TokenUsage contract — and the Gemini provider — treat
@@ -1394,10 +1429,6 @@ class OpenAICompatibleLLM(LLMInterface):
         self._apply_provider_extra_body_defaults(extra_body)
         if self.provider == "groq":
             call_params["seed"] = DEFAULT_LLM_SEED
-            if self.groq_service_tier:
-                extra_body["service_tier"] = self.groq_service_tier
-        if self.provider == "openai" and self.openai_service_tier:
-            call_params["service_tier"] = self.openai_service_tier
         if extra_body:
             call_params["extra_body"] = extra_body
 
@@ -1430,13 +1461,14 @@ class OpenAICompatibleLLM(LLMInterface):
                 # Record metrics
                 duration = time.time() - start_time
                 usage = response.usage
-                response_usage = _usage_from_openai_response(response)
-                input_tokens = response_usage.input_tokens
-                output_tokens = response_usage.output_tokens
-                cached_tokens = response_usage.cached_tokens
+                input_tokens = usage.prompt_tokens or 0 if usage else 0
+                output_tokens = usage.completion_tokens or 0 if usage else 0
+                cached_tokens = 0
+                if usage and getattr(usage, "prompt_tokens_details", None):
+                    cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
                 thoughts_tokens = 0
                 if usage and getattr(usage, "completion_tokens_details", None):
-                    thoughts_tokens = _token_count(getattr(usage.completion_tokens_details, "reasoning_tokens", 0))
+                    thoughts_tokens = getattr(usage.completion_tokens_details, "reasoning_tokens", 0) or 0
                 # See ``call()``: OpenAI-compatible ``completion_tokens`` includes
                 # reasoning, so make ``output_tokens`` visible-only to avoid
                 # double-counting it against ``thoughts_tokens``.

@@ -433,7 +433,6 @@ def _update_ctx(threshold: float = 0.97):
 @pytest.mark.memory_backend_incompatible
 async def test_dedup_update_merge_folds_into_twin_and_deletes_updated() -> None:
     kwargs, conn, llm = _update_ctx()
-    conn.execute.side_effect = ["UPDATE 1", "DELETE 1"]
     llm.call.return_value = _DedupDecision(action="merge", text="Uzbek YouTube content is very rich and growing.")
     with _patch_probe([_obs("Uzbek content on YouTube is described as very rich.", 0.98)]):
         await _dedup_reconcile_update(**kwargs)

@@ -32,13 +32,8 @@ def request_context():
 
 
 @pytest_asyncio.fixture(scope="function")
-async def none_memory(pg0_db_url, embeddings, cross_encoder, query_analyzer, monkeypatch):
-    """MemoryEngine with provider=none and no named-profile selector."""
-    from hindsight_api.config import clear_config_cache
-
-    monkeypatch.delenv("HINDSIGHT_API_INFERENCE_PROFILE", raising=False)
-    monkeypatch.delenv("HINDSIGHT_API_INFERENCE_PROFILES_FILE", raising=False)
-    clear_config_cache()
+async def none_memory(pg0_db_url, embeddings, cross_encoder, query_analyzer):
+    """MemoryEngine with provider=none."""
     mem = MemoryEngine(
         db_url=pg0_db_url,
         memory_llm_provider="none",
@@ -59,7 +54,6 @@ async def none_memory(pg0_db_url, embeddings, cross_encoder, query_analyzer, mon
             await mem.close()
     except Exception:
         pass
-    clear_config_cache()
 
 
 @pytest_asyncio.fixture
@@ -207,10 +201,11 @@ async def test_reflect_raises_with_none_provider(none_memory, request_context):
 
 
 @pytest.mark.asyncio
-async def test_consolidation_disabled_with_none_provider(none_memory, request_context):
-    """Consolidation reports the canonical disabled status when provider=none."""
+async def test_consolidation_skipped_with_none_provider(none_memory, request_context):
+    """Consolidation handler should skip when provider=none."""
     result = await none_memory._handle_consolidation({"bank_id": "test_bank"})
-    assert result == {"status": "disabled", "bank_id": "test_bank"}
+    assert result["skipped"] is True
+    assert result["memories_processed"] == 0
 
 
 @pytest.mark.asyncio

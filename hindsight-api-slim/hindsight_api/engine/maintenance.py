@@ -528,7 +528,7 @@ class MaintenanceLoop:
             token = _current_schema.set(schema)
             try:
                 context = RequestContext(internal=True, tenant_id=tenant_id)
-                resolved = await engine._resolve_full_config(bank_id, context)
+                resolved = await engine._config_resolver.resolve_full_config(bank_id, context)
                 # Mirror the retain-time auto-consolidation gate (memory_engine): both
                 # observations and auto-consolidation must be enabled for this bank.
                 if not (resolved.enable_observations and resolved.enable_auto_consolidation):

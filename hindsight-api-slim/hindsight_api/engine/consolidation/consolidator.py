@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import asyncpg
 from pydantic import BaseModel, ValidationError, field_validator
 
-from ...config import ConsolidationIdentityAxis, get_config
+from ...config import ConsolidationProtectedVocabulary, get_config
 from ...worker.stage import set_stage
 from ..db import DatabaseBackend
 from ..db_utils import acquire_with_retry
@@ -136,69 +136,75 @@ def _norm_obs_text(text: str) -> str:
 
 
 @dataclass(frozen=True)
-class _IdentityToken:
+class _ProtectedTerm:
     value: str
     pattern: re.Pattern[str]
 
 
 @dataclass(frozen=True)
-class _IdentityAxis:
+class _ProtectedVocabulary:
     name: str
-    tokens: tuple[_IdentityToken, ...]
+    terms: tuple[_ProtectedTerm, ...]
 
 
 @dataclass(frozen=True)
-class _IdentityConflict:
-    axis: str
-    source_tokens: tuple[str, ...]
-    target_tokens: tuple[str, ...]
+class _ProtectedVocabularyConflict:
+    vocabulary: str
+    source_terms: tuple[str, ...]
+    target_terms: tuple[str, ...]
 
 
 @lru_cache(maxsize=128)
-def _compile_identity_axes(axes: tuple[ConsolidationIdentityAxis, ...]) -> tuple[_IdentityAxis, ...]:
+def _compile_protected_vocabularies(
+    vocabularies: tuple[ConsolidationProtectedVocabulary, ...],
+) -> tuple[_ProtectedVocabulary, ...]:
     """Compile each validated bank vocabulary once."""
 
-    def compile_token(token: str) -> _IdentityToken:
-        body = r"\s+".join(re.escape(part) for part in token.split())
-        return _IdentityToken(value=token, pattern=re.compile(body))
+    def compile_term(term: str) -> _ProtectedTerm:
+        body = r"\s+".join(re.escape(part) for part in term.split())
+        return _ProtectedTerm(value=term, pattern=re.compile(body))
 
     return tuple(
-        _IdentityAxis(name=axis.name, tokens=tuple(compile_token(token) for token in axis.tokens)) for axis in axes
+        _ProtectedVocabulary(
+            name=vocabulary.name,
+            terms=tuple(compile_term(term) for term in vocabulary.terms),
+        )
+        for vocabulary in vocabularies
     )
 
 
-def _identity_conflicts(
+def _protected_vocabulary_conflicts(
     source_text: str,
     target_text: str,
-    axes: tuple[_IdentityAxis, ...],
-) -> tuple[_IdentityConflict, ...]:
-    """Return known-versus-known disjoint identities; unknown identities remain permissive."""
+    vocabularies: tuple[_ProtectedVocabulary, ...],
+) -> tuple[_ProtectedVocabularyConflict, ...]:
+    """Return known-versus-known disjoint protected terms; unknown terms remain permissive."""
 
     def is_identifier_char(character: str) -> bool:
         category = unicodedata.category(character)
         return character == "-" or category[0] in {"L", "M", "N"} or category == "Pc"
 
-    def has_token(text: str, token: _IdentityToken) -> bool:
+    def has_term(text: str, term: _ProtectedTerm) -> bool:
         return any(
             (match.start() == 0 or not is_identifier_char(text[match.start() - 1]))
             and (match.end() == len(text) or not is_identifier_char(text[match.end()]))
-            for match in token.pattern.finditer(text)
+            for match in term.pattern.finditer(text)
         )
 
-    def identities(text: str, axis: _IdentityAxis) -> frozenset[str]:
+    def matched_terms(text: str, vocabulary: _ProtectedVocabulary) -> frozenset[str]:
         folded = unicodedata.normalize("NFKC", text).casefold()
-        return frozenset(token.value for token in axis.tokens if has_token(folded, token))
+        return frozenset(term.value for term in vocabulary.terms if has_term(folded, term))
 
-    conflicts: list[_IdentityConflict] = []
-    for axis in axes:
-        source_tokens = identities(source_text, axis)
-        target_tokens = identities(target_text, axis)
-        if source_tokens and target_tokens and source_tokens.isdisjoint(target_tokens):
+    conflicts: list[_ProtectedVocabularyConflict] = []
+    for vocabulary in vocabularies:
+        source_terms = matched_terms(source_text, vocabulary)
+        target_terms = matched_terms(target_text, vocabulary)
+        if source_terms and target_terms and source_terms.isdisjoint(target_terms):
             conflicts.append(
-                _IdentityConflict(
-                    axis=axis.name,
-                    source_tokens=tuple(sorted(source_tokens)),
-                    target_tokens=tuple(sorted(target_tokens)),
+                _ProtectedVocabularyConflict(
+                    vocabulary=vocabulary.name,
+                    source_terms=tuple(sorted(source_terms)),
+                    target_terms=tuple(sorted(target_terms)),
                 )
             )
     return tuple(conflicts)
@@ -368,8 +374,8 @@ async def _dedup_adjudicate(
     anchor_emb_str: str | None,
     tags: list[str] | None,
     exclude_id: str | None,
-    identity_axes: tuple[_IdentityAxis, ...] = (),
-    identity_evidence: tuple[str, ...] = (),
+    protected_vocabularies: tuple[_ProtectedVocabulary, ...] = (),
+    protected_evidence: tuple[str, ...] = (),
 ) -> _DedupOutcome:
     """Probe one observation's embedding against in-scope observations and adjudicate a merge.
 
@@ -417,15 +423,15 @@ async def _dedup_adjudicate(
             continue  # never match the anchor observation against itself
         conflicts = tuple(
             conflict
-            for evidence_text in (anchor_text, *identity_evidence)
-            for conflict in _identity_conflicts(evidence_text, r.text, identity_axes)
+            for evidence_text in (anchor_text, *protected_evidence)
+            for conflict in _protected_vocabulary_conflicts(evidence_text, r.text, protected_vocabularies)
         )
         if conflicts:
             logger.warning(
-                "[CONSOLIDATION] dedup rejected identity-conflicting candidate %s: %s",
+                "[CONSOLIDATION] dedup rejected protected-vocabulary candidate %s: %s",
                 rid,
                 ", ".join(
-                    f"{conflict.axis}:{'/'.join(conflict.source_tokens)}!={'/'.join(conflict.target_tokens)}"
+                    f"{conflict.vocabulary}:{'/'.join(conflict.source_terms)}!={'/'.join(conflict.target_terms)}"
                     for conflict in conflicts
                 ),
             )
@@ -451,12 +457,12 @@ async def _dedup_adjudicate(
     merged_text = (sanitize_llm_output(decision.text) or "").strip() or best_text
     merge_conflicts = tuple(
         conflict
-        for evidence_text in (anchor_text, best_text, *identity_evidence)
-        for conflict in _identity_conflicts(evidence_text, merged_text, identity_axes)
+        for evidence_text in (anchor_text, best_text, *protected_evidence)
+        for conflict in _protected_vocabulary_conflicts(evidence_text, merged_text, protected_vocabularies)
     )
     if merge_conflicts:
         logger.warning(
-            "[CONSOLIDATION] dedup rejected identity-conflicting merged text for candidate %s",
+            "[CONSOLIDATION] dedup rejected protected-vocabulary merged text for candidate %s",
             best_id,
         )
         return _DedupOutcome(best_id=best_id, merged_text="", should_merge=False, best_text=best_text)
@@ -473,8 +479,8 @@ async def _dedup_reconcile_create(
     create_source_ids: list[uuid.UUID],
     tags: list[str] | None,
     source_bounds: _TemporalBounds,
-    identity_axes: tuple[_IdentityAxis, ...] = (),
-    source_identity_texts: tuple[str, ...] = (),
+    protected_vocabularies: tuple[_ProtectedVocabulary, ...] = (),
+    source_protected_texts: tuple[str, ...] = (),
     txn=None,
 ) -> str | None:
     """Semantic dedup for a single CREATE (create-time, focused 1-by-1).
@@ -500,8 +506,8 @@ async def _dedup_reconcile_create(
         None,
         tags,
         exclude_id=None,
-        identity_axes=identity_axes,
-        identity_evidence=source_identity_texts,
+        protected_vocabularies=protected_vocabularies,
+        protected_evidence=source_protected_texts,
     )
     if not outcome.should_merge or outcome.best_id is None:
         return None
@@ -580,8 +586,8 @@ async def _dedup_reconcile_update(
     updated_text: str,
     updated_emb_str: str | None,
     tags: list[str] | None,
-    identity_axes: tuple[_IdentityAxis, ...] = (),
-    identity_evidence: tuple[str, ...] = (),
+    protected_vocabularies: tuple[_ProtectedVocabulary, ...] = (),
+    protected_evidence: tuple[str, ...] = (),
     txn=None,
 ) -> None:
     """Semantic dedup for an UPDATE (after the observation was rewritten + re-embedded).
@@ -604,8 +610,8 @@ async def _dedup_reconcile_update(
         updated_emb_str,
         tags,
         exclude_id=updated_id,
-        identity_axes=identity_axes,
-        identity_evidence=identity_evidence,
+        protected_vocabularies=protected_vocabularies,
+        protected_evidence=protected_evidence,
     )
     if not outcome.should_merge or outcome.best_id is None:
         return
@@ -933,26 +939,26 @@ class _BatchLLMResult:
 
 
 @dataclass(frozen=True)
-class _IdentityViolation:
+class _ProtectedVocabularyViolation:
     action: Literal["create", "update"]
     observation_id: str | None
     source_fact_id: str
-    conflicts: tuple[_IdentityConflict, ...]
+    conflicts: tuple[_ProtectedVocabularyConflict, ...]
 
 
-def _find_identity_violations(
+def _find_protected_vocabulary_violations(
     result: _BatchLLMResult,
     memories: list[dict[str, Any]],
     observations: "list[MemoryFact]",
-    axes: tuple[_IdentityAxis, ...],
-) -> tuple[_IdentityViolation, ...]:
+    vocabularies: tuple[_ProtectedVocabulary, ...],
+) -> tuple[_ProtectedVocabularyViolation, ...]:
     """Inspect source, target, and proposed texts at the model-output boundary."""
-    if not axes:
+    if not vocabularies:
         return ()
 
     memories_by_id = {str(memory["id"]): memory for memory in memories}
     observations_by_id = {str(observation.id): observation for observation in observations}
-    violations: list[_IdentityViolation] = []
+    violations: list[_ProtectedVocabularyViolation] = []
 
     def inspect_sources(
         *,
@@ -965,10 +971,10 @@ def _find_identity_violations(
             source = memories_by_id.get(source_fact_id)
             if source is None:
                 continue
-            conflicts = _identity_conflicts(str(source.get("text") or ""), target_text, axes)
+            conflicts = _protected_vocabulary_conflicts(str(source.get("text") or ""), target_text, vocabularies)
             if conflicts:
                 violations.append(
-                    _IdentityViolation(
+                    _ProtectedVocabularyViolation(
                         action=action,
                         observation_id=observation_id,
                         source_fact_id=source_fact_id,
@@ -1000,10 +1006,10 @@ def _find_identity_violations(
             target_text=update.text,
             observation_id=update.observation_id,
         )
-        conflicts = _identity_conflicts(update.text, target.text, axes)
+        conflicts = _protected_vocabulary_conflicts(update.text, target.text, vocabularies)
         if conflicts:
             violations.append(
-                _IdentityViolation(
+                _ProtectedVocabularyViolation(
                     action="update",
                     observation_id=update.observation_id,
                     source_fact_id=next(iter(update.source_fact_ids), "<update-text>"),
@@ -1013,12 +1019,12 @@ def _find_identity_violations(
     return tuple(violations)
 
 
-def _format_identity_violations(violations: tuple[_IdentityViolation, ...]) -> str:
+def _format_protected_vocabulary_violations(violations: tuple[_ProtectedVocabularyViolation, ...]) -> str:
     return "; ".join(
         f"action={violation.action} observation={violation.observation_id or '-'} "
         f"source={violation.source_fact_id} "
         + ", ".join(
-            f"{conflict.axis}:{'/'.join(conflict.source_tokens)}!={'/'.join(conflict.target_tokens)}"
+            f"{conflict.vocabulary}:{'/'.join(conflict.source_terms)}!={'/'.join(conflict.target_terms)}"
             for conflict in violation.conflicts
         )
         for violation in violations
@@ -1475,32 +1481,36 @@ async def run_consolidation_job(
     Returns:
         Dict with consolidation results
     """
-    async with memory_engine._bank_operation_scope(bank_id, request_context):
-        config = await memory_engine._resolve_full_config(bank_id, request_context)
-        llm_config = memory_engine._consolidation_llm_config.with_config(
-            config, bank_id=bank_id, operation="consolidation"
-        )
-        if llm_config.provider == "none":
-            logger.debug(f"Consolidation disabled for bank {bank_id}: selected route is 'none'")
-            return {"status": "disabled", "bank_id": bank_id}
+    # Resolve bank-specific config with hierarchical overrides
+    config = await memory_engine._config_resolver.resolve_full_config(bank_id, request_context)
 
-        trace_ctx = trace_context_of(llm_config)
-        trace_token = set_trace_context(trace_ctx) if trace_ctx is not None else None
-        try:
-            return await _run_consolidation_job(
-                memory_engine,
-                bank_id,
-                request_context,
-                config,
-                llm_config,
-                operation_id,
-                observation_scopes,
-                pending_refresh_tags,
-            )
-        finally:
-            if trace_token is not None:
-                reset_trace_context(trace_token)
-                memory_engine._llm_recorder.attach_memory_ids(trace_ctx)
+    # Build a configured LLM wrapper that applies per-bank settings (e.g. safety settings)
+    # to every call without leaking across operations.
+    llm_config = memory_engine._consolidation_llm_config.with_config(config, bank_id=bank_id, operation="consolidation")
+
+    # Bind the operation trace context for the whole run so the create/update DB
+    # sites (deep inside _process_memory_batch) can accumulate the observations
+    # this consolidation produced and the source memories it consumed onto the
+    # trace — flushed onto every trace row on exit by attach_memory_ids.
+    trace_ctx = trace_context_of(llm_config)
+    trace_token = set_trace_context(trace_ctx) if trace_ctx is not None else None
+    try:
+        return await _run_consolidation_job(
+            memory_engine,
+            bank_id,
+            request_context,
+            config,
+            llm_config,
+            operation_id,
+            observation_scopes,
+            pending_refresh_tags,
+        )
+    finally:
+        if trace_token is not None:
+            reset_trace_context(trace_token)
+            # Fire-and-forget: patched on a background task, off the consolidation
+            # critical path.
+            memory_engine._llm_recorder.attach_memory_ids(trace_ctx)
 
 
 async def _run_consolidation_job(
@@ -2267,7 +2277,6 @@ async def _trigger_mental_model_refreshes(
                 automatic=True,
             )
             refreshed_count += 1
-
             logger.info(
                 f"[CONSOLIDATION] Triggered refresh for mental model {mental_model_id} "
                 f"(name: {row['name']}) in bank {bank_id}"
@@ -2381,9 +2390,11 @@ async def _process_memory_batch(
             )
 
     # 3. Single guarded LLM call
-    identity_axes = _compile_identity_axes(tuple(getattr(config, "consolidation_identity_axes", ())))
+    protected_vocabularies = _compile_protected_vocabularies(
+        tuple(getattr(config, "consolidation_protected_vocabularies", ()))
+    )
     t0 = time.time()
-    llm_result = await _consolidate_batch_with_identity_guard(
+    llm_result = await _consolidate_batch_with_protected_vocabularies(
         llm_config=llm_config,
         memories=memories,
         union_observations=union_observations,
@@ -2391,7 +2402,7 @@ async def _process_memory_batch(
         config=config,
         remaining_observation_slots=remaining_observation_slots,
         max_observations_per_scope=max_obs,
-        identity_axes=identity_axes,
+        protected_vocabularies=protected_vocabularies,
         perf=perf,
     )
     if perf:
@@ -2476,8 +2487,8 @@ async def _process_memory_batch(
                 update.text,
                 updated_emb_str,
                 agg.tags,
-                identity_axes=identity_axes,
-                identity_evidence=tuple(str(memory.get("text") or "") for memory in source_mems),
+                protected_vocabularies=protected_vocabularies,
+                protected_evidence=tuple(str(memory.get("text") or "") for memory in source_mems),
                 txn=txn,
             )
 
@@ -2527,8 +2538,8 @@ async def _process_memory_batch(
                 create_source_ids,
                 agg.tags,
                 _TemporalBounds.of(agg),
-                identity_axes=identity_axes,
-                source_identity_texts=tuple(str(memory.get("text") or "") for memory in source_mems),
+                protected_vocabularies=protected_vocabularies,
+                source_protected_texts=tuple(str(memory.get("text") or "") for memory in source_mems),
                 txn=txn,
             )
             if merged_into is not None:
@@ -2960,7 +2971,7 @@ async def _find_related_observations(
     # max_tokens naturally limits how many observations are returned
     from ...tracing import get_tracer, is_tracing_enabled
 
-    config = await memory_engine._resolve_full_config(bank_id, request_context)
+    config = await memory_engine._config_resolver.resolve_full_config(bank_id, request_context)
 
     # SECURITY: Use all_strict matching if tags provided to prevent cross-scope consolidation
     tags_match = "all_strict" if tags else "any"
@@ -3155,7 +3166,6 @@ async def _consolidate_batch_with_llm(
     config: Any,
     remaining_observation_slots: int | None = None,
     max_observations_per_scope: int = -1,
-    max_attempts_override: int | None = None,
 ) -> _BatchLLMResult:
     """Single LLM call for a batch of facts against a pooled set of observations."""
     if config is None:
@@ -3234,7 +3244,7 @@ async def _consolidate_batch_with_llm(
         supports_max_items=config.llm_supports_max_items,
     )
 
-    max_attempts = max_attempts_override or config.consolidation_max_attempts
+    max_attempts = config.consolidation_max_attempts
     inner_max_retries = config.consolidation_llm_max_retries
     last_exc: Exception | None = None
     attempts_made = 0
@@ -3328,7 +3338,7 @@ async def _consolidate_batch_with_llm(
     )
 
 
-async def _consolidate_batch_with_identity_guard(
+async def _consolidate_batch_with_protected_vocabularies(
     *,
     llm_config: Any,
     memories: list[dict[str, Any]],
@@ -3337,11 +3347,11 @@ async def _consolidate_batch_with_identity_guard(
     config: Any,
     remaining_observation_slots: int | None,
     max_observations_per_scope: int,
-    identity_axes: tuple[_IdentityAxis, ...],
+    protected_vocabularies: tuple[_ProtectedVocabulary, ...],
     perf: ConsolidationPerfLog | None,
 ) -> _BatchLLMResult:
-    """Retry model output without identity-conflicting targets, then fail closed."""
-    if not identity_axes:
+    """Retry model output without protected-vocabulary-conflicting targets, then fail closed."""
+    if not protected_vocabularies:
         result = await _consolidate_batch_with_llm(
             llm_config=llm_config,
             memories=memories,
@@ -3378,11 +3388,11 @@ async def _consolidate_batch_with_identity_guard(
                 return result
             continue
 
-        violations = _find_identity_violations(
+        violations = _find_protected_vocabulary_violations(
             result,
             memories,
             union_observations,
-            identity_axes,
+            protected_vocabularies,
         )
         accounted_source_ids = {
             source_id for action in chain(result.creates, result.updates) for source_id in action.source_fact_ids
@@ -3396,10 +3406,10 @@ async def _consolidate_batch_with_identity_guard(
 
         if violations:
             logger.warning(
-                "[CONSOLIDATION] rejected identity-conflicting model output (attempt %d/%d): %s",
+                "[CONSOLIDATION] rejected protected-vocabulary-conflicting model output (attempt %d/%d): %s",
                 attempt,
                 max_attempts,
-                _format_identity_violations(violations),
+                _format_protected_vocabulary_violations(violations),
             )
             newly_rejected_ids = {
                 violation.observation_id for violation in violations if violation.observation_id is not None
@@ -3427,7 +3437,7 @@ async def _consolidate_batch_with_identity_guard(
             ]
         else:
             logger.warning(
-                "[CONSOLIDATION] retry did not preserve identity-guard constraints "
+                "[CONSOLIDATION] retry did not preserve protected-vocabulary constraints "
                 "(attempt %d/%d): missing_sources=%s rejected_targets=%s",
                 attempt,
                 max_attempts,
@@ -3437,7 +3447,7 @@ async def _consolidate_batch_with_identity_guard(
 
         if attempt == max_attempts:
             logger.error(
-                "[CONSOLIDATION] identity guard exhausted after %d attempts; failing batch",
+                "[CONSOLIDATION] protected-vocabulary guard exhausted after %d attempts; failing batch",
                 max_attempts,
             )
             return _BatchLLMResult(

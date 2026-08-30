@@ -275,10 +275,7 @@ async def import_documents(
         result.observations_skipped = outcome.skipped
         result.remapped_unit_ids.update(outcome.remapped_unit_ids)
 
-    # Whole-bank imports restore these rows after fact IDs are remapped below.
-    # Restoring them here first would make the later insert lose to ON CONFLICT
-    # and leave persisted mental-model evidence pointing at the source-bank IDs.
-    if parsed.manifest.archive_type != "bank" and (parsed.mental_models or parsed.knowledge_pages):
+    if parsed.mental_models or parsed.knowledge_pages:
         mm_embeddings = await _regenerate_mental_model_embeddings(embeddings_model, parsed.mental_models)
         async with acquire_with_retry(backend) as conn:
             # Document archives serialize bank-row JSON values directly. Keep
@@ -1149,13 +1146,6 @@ def _remap_mental_model_evidence(rows: list[dict], unit_id_map: dict[str, str]) 
         if isinstance(previous, dict):
             _remap_based_on_ids(previous, unit_id_map)
             row["previous_reflect_response"] = previous
-        history_content = _decode_json_object(row.get("content"))
-        if isinstance(history_content, dict):
-            historical_response = _decode_json_object(history_content.get("previous_reflect_response"))
-            if isinstance(historical_response, dict):
-                _remap_based_on_ids(historical_response, unit_id_map)
-                history_content["previous_reflect_response"] = historical_response
-                row["content"] = history_content
 
 
 def _decode_json_object(value: Any) -> Any:

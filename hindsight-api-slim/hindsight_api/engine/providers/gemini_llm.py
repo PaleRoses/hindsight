@@ -47,17 +47,11 @@ except ImportError:
 
 
 def _to_int(value: Any) -> int:
-    """Coerce Gemini's optional/string token counts to a non-negative integer."""
-    if isinstance(value, bool):
+    """Coerce Gemini's optional/string completion counts to int, defaulting to 0."""
+    try:
+        return int(value)
+    except (ValueError, TypeError):
         return 0
-    if isinstance(value, int):
-        return max(0, value)
-    if isinstance(value, str):
-        try:
-            return max(0, int(value))
-        except ValueError:
-            return 0
-    return 0
 
 
 def _usage_from_gemini_response(response: Any) -> LLMResponseUsage:
@@ -66,9 +60,9 @@ def _usage_from_gemini_response(response: Any) -> LLMResponseUsage:
     if not usage:
         return LLMResponseUsage()
     return LLMResponseUsage(
-        input_tokens=_to_int(getattr(usage, "prompt_token_count", 0)),
-        output_tokens=_to_int(getattr(usage, "candidates_token_count", 0)),
-        cached_tokens=_to_int(getattr(usage, "cached_content_token_count", 0)),
+        input_tokens=usage.prompt_token_count or 0,
+        output_tokens=usage.candidates_token_count or 0,
+        cached_tokens=getattr(usage, "cached_content_token_count", 0) or 0,
     )
 
 
@@ -202,15 +196,6 @@ class GeminiLLM(LLMInterface):
         # (env: HINDSIGHT_API_LLM_EXTRA_BODY).
         self._extra_body: dict[str, Any] = kwargs.get("extra_body") or {}
 
-        timeout = kwargs.get("timeout")
-        self._http_options: dict[str, Any] = {}
-        if self.base_url:
-            self._http_options["base_url"] = self.base_url
-        if timeout is not None:
-            self._http_options["timeout"] = round(timeout * 1000)
-        if default_headers := kwargs.get("default_headers"):
-            self._http_options["headers"] = dict(default_headers)
-
         # Context-cache manager. Lazy-initialized on first cache lookup so
         # nothing happens for models/workloads that never reach it. The instance
         # default here is off (a directly-constructed GeminiLLM doesn't cache); the
@@ -229,7 +214,7 @@ class GeminiLLM(LLMInterface):
         if not self.api_key:
             raise ValueError("Gemini provider requires api_key")
 
-        self._client = genai.Client(api_key=self.api_key, http_options=self._http_options or None)
+        self._client = genai.Client(api_key=self.api_key)
         logger.info(f"Gemini API: model={self.model}")
 
     def _apply_service_tier(self, config_kwargs: dict[str, Any]) -> None:
@@ -288,8 +273,6 @@ class GeminiLLM(LLMInterface):
         }
         if credentials is not None:
             client_kwargs["credentials"] = credentials
-        if self._http_options:
-            client_kwargs["http_options"] = self._http_options
 
         self._client = genai.Client(**client_kwargs)
 
@@ -498,10 +481,10 @@ class GeminiLLM(LLMInterface):
                 cached_tokens = 0
                 if hasattr(response, "usage_metadata") and response.usage_metadata:
                     usage = response.usage_metadata
-                    input_tokens = _to_int(getattr(usage, "prompt_token_count", 0))
-                    output_tokens = _to_int(getattr(usage, "candidates_token_count", 0))
-                    cached_input_tokens = _to_int(getattr(usage, "cached_content_token_count", 0))
-                    thoughts_tokens = _to_int(getattr(usage, "thoughts_token_count", 0))
+                    input_tokens = usage.prompt_token_count or 0
+                    output_tokens = usage.candidates_token_count or 0
+                    cached_input_tokens = getattr(usage, "cached_content_token_count", 0) or 0
+                    thoughts_tokens = getattr(usage, "thoughts_token_count", 0) or 0
                     # Tracing/TokenUsage consume ``cached_tokens``; metrics consume
                     # ``cached_input_tokens`` — same value, two downstream names.
                     cached_tokens = cached_input_tokens
@@ -871,10 +854,10 @@ class GeminiLLM(LLMInterface):
                 cached_input_tokens = 0
                 thoughts_tokens = 0
                 if response.usage_metadata:
-                    input_tokens = _to_int(getattr(response.usage_metadata, "prompt_token_count", 0))
-                    output_tokens = _to_int(getattr(response.usage_metadata, "candidates_token_count", 0))
-                    cached_input_tokens = _to_int(getattr(response.usage_metadata, "cached_content_token_count", 0))
-                    thoughts_tokens = _to_int(getattr(response.usage_metadata, "thoughts_token_count", 0))
+                    input_tokens = response.usage_metadata.prompt_token_count or 0
+                    output_tokens = response.usage_metadata.candidates_token_count or 0
+                    cached_input_tokens = getattr(response.usage_metadata, "cached_content_token_count", 0) or 0
+                    thoughts_tokens = getattr(response.usage_metadata, "thoughts_token_count", 0) or 0
 
                 # Record metrics
                 duration = time.time() - start_time

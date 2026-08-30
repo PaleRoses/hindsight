@@ -81,17 +81,17 @@ class FakeBankConfigConnection:
 
 
 @pytest.mark.asyncio
-async def test_identity_axes_are_canonicalized_before_persistence() -> None:
+async def test_protected_vocabularies_are_canonicalized_before_persistence() -> None:
     backend = FakeBankConfigBackend()
     resolver = ConfigResolver(backend=backend)
 
     await resolver.update_bank_config(
         "bank",
-        {"consolidation_identity_axes": [{"name": " Package ", "tokens": ["Straße", " MELUSINE-WORLD-SCHOBER "]}]},
+        {"consolidation_protected_vocabularies": [{"name": " Environment ", "terms": ["Straße", " PRODUCTION "]}]},
     )
 
-    assert backend.config["consolidation_identity_axes"] == [
-        {"name": "Package", "tokens": ["strasse", "melusine-world-schober"]}
+    assert backend.config["consolidation_protected_vocabularies"] == [
+        {"name": "Environment", "terms": ["strasse", "production"]}
     ]
 
 
@@ -165,11 +165,10 @@ async def test_hierarchical_fields_categorization():
     assert "enable_graph_retrieval" in configurable
     assert "enable_reranking" in configurable
     assert "mental_model_min_refresh_interval_seconds" in configurable
-    assert "inference_profile" in configurable
-    assert "consolidation_identity_axes" in configurable
+    assert "consolidation_protected_vocabularies" in configurable
 
     # Verify count is correct
-    assert len(configurable) == 49
+    assert len(configurable) == 48
 
     # Verify credential fields (NEVER exposed)
     assert "llm_api_key" in credentials

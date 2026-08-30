@@ -102,17 +102,11 @@ class TestBindBankIdDecorator:
         engine = object.__new__(MemoryEngine)
         engine._reflect_llm_config = None
         engine._operation_validator = None
-        from hindsight_api.config import _get_raw_config
-
-        engine._config_resolver = SimpleNamespace(resolve_full_config=AsyncMock(return_value=_get_raw_config()))
         observed_bank_ids: list[str | None] = []
 
-        with (
-            patch.object(engine, "_authenticate_tenant", AsyncMock()),
-            patch(
-                "hindsight_api.engine.memory_engine.sanitize_text",
-                side_effect=lambda value: observed_bank_ids.append(get_current_bank_id()) or value,
-            ),
+        with patch(
+            "hindsight_api.engine.memory_engine.sanitize_text",
+            side_effect=lambda value: observed_bank_ids.append(get_current_bank_id()) or value,
         ):
             with pytest.raises(ValueError, match="Memory LLM API key not set"):
                 await engine.reflect_async("user-reflect", "question", request_context=RequestContext())

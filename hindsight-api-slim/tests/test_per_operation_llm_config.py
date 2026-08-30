@@ -19,13 +19,10 @@ def setup_test_env():
         "HINDSIGHT_API_SKIP_LLM_VERIFICATION": "true",
         "HINDSIGHT_API_LLM_PROVIDER": "mock",
         "HINDSIGHT_API_LLM_MODEL": "default-model",
-        "HINDSIGHT_API_LLM_REASONING_EFFORT": "high",
         "HINDSIGHT_API_RETAIN_LLM_PROVIDER": "mock",
         "HINDSIGHT_API_RETAIN_LLM_MODEL": "retain-model",
         "HINDSIGHT_API_REFLECT_LLM_PROVIDER": "mock",
         "HINDSIGHT_API_REFLECT_LLM_MODEL": "reflect-model",
-        "HINDSIGHT_API_REFLECT_LLM_REASONING_EFFORT": "low",
-        "HINDSIGHT_API_CONSOLIDATION_LLM_REASONING_EFFORT": "medium",
     }
 
     # Save original values
@@ -63,7 +60,6 @@ class TestPerOperationLLMConfig:
         # Default config
         assert config.llm_provider == "mock"
         assert config.llm_model == "default-model"
-        assert config.llm_reasoning_effort == "high"
 
         # Retain config
         assert config.retain_llm_provider == "mock"
@@ -72,8 +68,6 @@ class TestPerOperationLLMConfig:
         # Reflect config
         assert config.reflect_llm_provider == "mock"
         assert config.reflect_llm_model == "reflect-model"
-        assert config.reflect_llm_reasoning_effort == "low"
-        assert config.consolidation_llm_reasoning_effort == "medium"
 
     def test_memory_engine_creates_separate_llm_configs(self):
         """Test that MemoryEngine creates separate LLM configs for each operation."""
@@ -94,31 +88,6 @@ class TestPerOperationLLMConfig:
         # Verify reflect config
         assert engine._reflect_llm_config.provider == "mock"
         assert engine._reflect_llm_config.model == "reflect-model"
-
-        # Operation-specific effort does not widen the retain or reflect routes.
-        assert engine._retain_llm_config.reasoning_effort == "high"
-        assert engine._reflect_llm_config.reasoning_effort == "low"
-        assert engine._consolidation_llm_config.reasoning_effort == "medium"
-
-    def test_consolidation_effort_reaches_inherited_multi_llm_members(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Every routed consolidation provider inherits the operation effort."""
-        from hindsight_api import MemoryEngine
-        from hindsight_api.config import clear_config_cache
-
-        monkeypatch.setenv("HINDSIGHT_API_LLM_1_PROVIDER", "mock")
-        monkeypatch.setenv("HINDSIGHT_API_LLM_1_MODEL", "fallback-model")
-        monkeypatch.setenv("HINDSIGHT_API_LLM_STRATEGY", '{"mode": "failover"}')
-        clear_config_cache()
-
-        engine = MemoryEngine(skip_llm_verification=True)
-
-        assert [member.reasoning_effort for member in engine._consolidation_llm_config._members] == [
-            "medium",
-            "medium",
-        ]
 
     def test_groq_openai_service_tier_threaded_into_per_operation_configs(self, monkeypatch):
         """The groq/openai service-tier config knobs must reach every per-operation
@@ -222,7 +191,7 @@ class TestMockLLMProvider:
                 scope="test_scope",
             )
 
-        asyncio.get_event_loop().run_until_complete(make_call())
+        result = asyncio.get_event_loop().run_until_complete(make_call())
 
         # Verify call was recorded
         calls = provider.get_mock_calls()
@@ -335,7 +304,6 @@ class TestReflectUsesReflectLLMConfig:
         from unittest.mock import AsyncMock
 
         from hindsight_api import MemoryEngine
-        from hindsight_api.config import _get_raw_config
         from hindsight_api.engine.memory_engine import DirectivePage
         from hindsight_api.engine.reflect.models import ReflectAgentResult
         from hindsight_api.models import RequestContext
@@ -350,19 +318,15 @@ class TestReflectUsesReflectLLMConfig:
 
         engine._authenticate_tenant = AsyncMock()  # type: ignore[method-assign]
         engine.get_bank_profile = AsyncMock(return_value={"name": "Test", "mission": ""})  # type: ignore[method-assign]
-        engine.get_bank_freshness = AsyncMock(
-            return_value={
-                "last_consolidated_at": None,
-                "pending_consolidation": 0,
-                "last_memory_write_at": None,
-            }
+        engine.get_bank_stats = AsyncMock(
+            return_value=SimpleNamespace(last_consolidated_at=None, pending_consolidation=0)
         )  # type: ignore[method-assign]
         engine.list_directives = AsyncMock(  # type: ignore[method-assign]
             return_value=DirectivePage(items=[], total=0)
         )
-        engine._get_backend = AsyncMock(return_value=SimpleNamespace())  # type: ignore[method-assign]
+        engine._get_pool = AsyncMock(return_value=SimpleNamespace())  # type: ignore[method-assign]
         engine._config_resolver = SimpleNamespace(
-            resolve_full_config=AsyncMock(return_value=_get_raw_config()),
+            resolve_full_config=AsyncMock(return_value=SimpleNamespace(llm_gemini_safety_settings=None)),
             get_bank_config=AsyncMock(return_value={}),
         )
 
@@ -537,8 +501,6 @@ class TestPerOperationReasoningEffort:
 
         os.environ["HINDSIGHT_API_LLM_REASONING_EFFORT"] = "low"
         os.environ["HINDSIGHT_API_REFLECT_LLM_REASONING_EFFORT"] = "none"
-        os.environ.pop("HINDSIGHT_API_RETAIN_LLM_REASONING_EFFORT", None)
-        os.environ.pop("HINDSIGHT_API_CONSOLIDATION_LLM_REASONING_EFFORT", None)
         # retain/consolidation intentionally unset -> fall back to global "low".
 
         try:

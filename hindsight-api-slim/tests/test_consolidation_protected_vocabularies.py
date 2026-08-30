@@ -1,4 +1,4 @@
-"""Regression tests for consolidation's bank-configured semantic identity boundary."""
+"""Regression tests for consolidation's bank-configured protected-term boundary."""
 
 import types
 import uuid
@@ -6,20 +6,24 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from hindsight_api.config import ConsolidationIdentityAxis, parse_consolidation_identity_axes
+from hindsight_api.config import (
+    ConsolidationProtectedVocabulary,
+    HindsightConfig,
+    parse_consolidation_protected_vocabularies,
+)
 from hindsight_api.engine.consolidation.consolidator import (
     ConsolidationPerfLog,
     _BatchLLMResult,
-    _compile_identity_axes,
-    _consolidate_batch_with_identity_guard,
+    _compile_protected_vocabularies,
+    _consolidate_batch_with_protected_vocabularies,
     _CreateAction,
     _dedup_adjudicate,
     _dedup_reconcile_create,
     _dedup_reconcile_update,
     _DedupDecision,
-    _find_identity_violations,
-    _identity_conflicts,
-    _IdentityAxis,
+    _find_protected_vocabulary_violations,
+    _protected_vocabulary_conflicts,
+    _ProtectedVocabulary,
     _TemporalBounds,
     _UpdateAction,
 )
@@ -27,45 +31,31 @@ from hindsight_api.engine.response_models import MemoryFact
 from hindsight_api.engine.search.retrieval import SemanticBm25Result
 from hindsight_api.engine.search.types import RetrievalResult
 
-_PACKAGE_SOURCE_ID = "ef7c88ad-3726-48cc-b1a7-1a78b806d3c0"
-_PACKAGE_TARGET_ID = "0b9c5c4b-c6af-4b20-9881-3f40961137c0"
-_PACKAGE_SOURCE = (
-    "Working tree contains staged content-preserving source-root split for moonlight-analysis "
-    "with 85 renames at 100% similarity plus unstaged work."
+_ENVIRONMENT_SOURCE_ID = "ef7c88ad-3726-48cc-b1a7-1a78b806d3c0"
+_ENVIRONMENT_TARGET_ID = "0b9c5c4b-c6af-4b20-9881-3f40961137c0"
+_ENVIRONMENT_SOURCE = "The staging deployment enables the canary scheduler for ten percent of requests."
+_ENVIRONMENT_TARGET = "The production deployment keeps the stable scheduler for all requests."
+_PRODUCT_SOURCE = "Atlas release 4.2 enables streaming export and records its rollout status."
+_PRODUCT_TARGET = "Atlas release 4.1 supports batch export and remains the stable release."
+_UNKNOWN_SOURCE = (
+    "The benchmark fixture was deleted because compiler time and request latency measure different things."
 )
-_PACKAGE_TARGET = (
-    "All redundant child packages were deleted and converted to public named sublibraries "
-    "under the single melusine-world-schober umbrella manifest."
-)
-_DBSP_SOURCE = (
-    "Project project-dbsp-incrementalize-campaign implemented Phase 4b and directly revised its recorded phase status."
-)
-_DBSP_TARGET = (
-    "Project project-dbsp-incrementalize-campaign is a DBSP incrementalization campaign whose phases 1-3 are complete."
-)
-_BENCHMARK_SOURCE = (
-    "The constant-folded benchmark row was deleted because compiler time and end-to-end runtime "
-    "measure different things."
-)
-_BENCHMARK_TARGET = (
-    "Benchmark guidance requires larger fixtures and isolated processes so comparable CSV output "
-    "reflects meaningful runtime ratios."
-)
+_UNKNOWN_TARGET = "Benchmark guidance requires larger fixtures and isolated processes for comparable latency ratios."
 
 
-def _axes() -> tuple[_IdentityAxis, ...]:
-    return _compile_identity_axes(
-        parse_consolidation_identity_axes(
+def _vocabularies() -> tuple[_ProtectedVocabulary, ...]:
+    return _compile_protected_vocabularies(
+        parse_consolidation_protected_vocabularies(
             [
                 {
-                    "name": "package",
-                    "tokens": ["moonlight-analysis", "melusine-world-schober"],
+                    "name": "environment",
+                    "terms": ["staging", "production"],
                 },
                 {
-                    "name": "campaign",
-                    "tokens": [
-                        "project-dbsp-incrementalize-campaign",
-                        "project-melusine-world-schober",
+                    "name": "product",
+                    "terms": [
+                        "atlas",
+                        "borealis",
                     ],
                 },
             ]
@@ -77,95 +67,109 @@ def _observation(observation_id: str, text: str) -> MemoryFact:
     return MemoryFact(id=observation_id, text=text, fact_type="observation")
 
 
-def test_identity_vocabulary_is_validated_and_canonicalized() -> None:
-    axes = parse_consolidation_identity_axes(
-        [{"name": " Package ", "tokens": ["Moonlight-Analysis", " melusine-world-schober "]}]
+def test_protected_vocabulary_is_validated_and_canonicalized() -> None:
+    vocabularies = parse_consolidation_protected_vocabularies(
+        [{"name": " Environment ", "terms": ["Staging", " production "]}]
     )
 
-    assert axes[0].name == "Package"
-    assert axes[0].tokens == ("moonlight-analysis", "melusine-world-schober")
+    assert vocabularies[0].name == "Environment"
+    assert vocabularies[0].terms == ("staging", "production")
 
 
 @pytest.mark.parametrize(
     "raw",
     [
         {},
-        [{"name": "package"}],
-        [{"name": "package", "tokens": ["moonlight-analysis"]}],
-        [{"name": "package", "tokens": ["same", "SAME"]}],
+        [{"name": "environment"}],
+        [{"name": "environment", "terms": ["staging"]}],
+        [{"name": "environment", "terms": ["same", "SAME"]}],
         [
-            {"name": "package", "tokens": ["one", "two"]},
-            {"name": "PACKAGE", "tokens": ["three", "four"]},
+            {"name": "environment", "terms": ["one", "two"]},
+            {"name": "ENVIRONMENT", "terms": ["three", "four"]},
         ],
     ],
 )
-def test_identity_vocabulary_rejects_ambiguous_shapes(raw: object) -> None:
+def test_protected_vocabulary_rejects_ambiguous_shapes(raw: object) -> None:
     with pytest.raises(ValueError):
-        parse_consolidation_identity_axes(raw)
+        parse_consolidation_protected_vocabularies(raw)
 
 
-def test_package_textual_twin_is_rejected() -> None:
-    conflicts = _identity_conflicts(_PACKAGE_SOURCE, _PACKAGE_TARGET, _axes())
+def test_environment_registry_is_loaded_from_server_config(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "HINDSIGHT_API_CONSOLIDATION_PROTECTED_VOCABULARIES",
+        '[{"name":"environment","terms":["staging","production"]}]',
+    )
+
+    config = HindsightConfig.from_env()
+
+    assert config.consolidation_protected_vocabularies == (
+        ConsolidationProtectedVocabulary(
+            name="environment",
+            terms=("staging", "production"),
+        ),
+    )
+
+
+def test_cross_environment_twin_is_rejected() -> None:
+    conflicts = _protected_vocabulary_conflicts(_ENVIRONMENT_SOURCE, _ENVIRONMENT_TARGET, _vocabularies())
 
     assert len(conflicts) == 1
-    assert conflicts[0].axis == "package"
-    assert conflicts[0].source_tokens == ("moonlight-analysis",)
-    assert conflicts[0].target_tokens == ("melusine-world-schober",)
+    assert conflicts[0].vocabulary == "environment"
+    assert conflicts[0].source_terms == ("staging",)
+    assert conflicts[0].target_terms == ("production",)
 
 
-def test_identity_matching_requires_identifier_boundaries() -> None:
-    source = "moonlight-analysis-old is an unrelated identifier"
+def test_protected_term_matching_requires_identifier_boundaries() -> None:
+    source = "staging-old is an unrelated identifier"
 
-    assert _identity_conflicts(source, _PACKAGE_TARGET, _axes()) == ()
-
-
-def test_same_campaign_update_remains_lawful() -> None:
-    assert _identity_conflicts(_DBSP_SOURCE, _DBSP_TARGET, _axes()) == ()
+    assert _protected_vocabulary_conflicts(source, _ENVIRONMENT_TARGET, _vocabularies()) == ()
 
 
-def test_unknown_benchmark_identity_remains_lawful() -> None:
-    assert _identity_conflicts(_BENCHMARK_SOURCE, _BENCHMARK_TARGET, _axes()) == ()
+def test_same_product_update_remains_lawful() -> None:
+    assert _protected_vocabulary_conflicts(_PRODUCT_SOURCE, _PRODUCT_TARGET, _vocabularies()) == ()
+
+
+def test_unknown_terms_remains_lawful() -> None:
+    assert _protected_vocabulary_conflicts(_UNKNOWN_SOURCE, _UNKNOWN_TARGET, _vocabularies()) == ()
 
 
 def test_update_violation_preserves_source_and_target_evidence() -> None:
     result = _BatchLLMResult(
         updates=[
             _UpdateAction(
-                observation_id=_PACKAGE_TARGET_ID,
-                source_fact_ids=[_PACKAGE_SOURCE_ID],
+                observation_id=_ENVIRONMENT_TARGET_ID,
+                source_fact_ids=[_ENVIRONMENT_SOURCE_ID],
                 text="Combined text that must never be written.",
             )
         ]
     )
 
-    violations = _find_identity_violations(
+    violations = _find_protected_vocabulary_violations(
         result,
-        [{"id": _PACKAGE_SOURCE_ID, "text": _PACKAGE_SOURCE}],
-        [_observation(_PACKAGE_TARGET_ID, _PACKAGE_TARGET)],
-        _axes(),
+        [{"id": _ENVIRONMENT_SOURCE_ID, "text": _ENVIRONMENT_SOURCE}],
+        [_observation(_ENVIRONMENT_TARGET_ID, _ENVIRONMENT_TARGET)],
+        _vocabularies(),
     )
 
     assert len(violations) == 1
-    assert violations[0].source_fact_id == _PACKAGE_SOURCE_ID
-    assert violations[0].observation_id == _PACKAGE_TARGET_ID
+    assert violations[0].source_fact_id == _ENVIRONMENT_SOURCE_ID
+    assert violations[0].observation_id == _ENVIRONMENT_TARGET_ID
 
 
 async def test_guard_retries_without_rejected_target_and_preserves_fact() -> None:
     bad = _BatchLLMResult(
         updates=[
             _UpdateAction(
-                observation_id=_PACKAGE_TARGET_ID,
-                source_fact_ids=[_PACKAGE_SOURCE_ID],
-                text="Bad cross-package merge.",
+                observation_id=_ENVIRONMENT_TARGET_ID,
+                source_fact_ids=[_ENVIRONMENT_SOURCE_ID],
+                text="Bad cross-environment merge.",
             )
         ],
         obs_count=1,
         prompt_chars=100,
     )
     good = _BatchLLMResult(
-        creates=[
-            _CreateAction(text="Standalone moonlight-analysis observation.", source_fact_ids=[_PACKAGE_SOURCE_ID])
-        ],
+        creates=[_CreateAction(text="Standalone staging observation.", source_fact_ids=[_ENVIRONMENT_SOURCE_ID])],
         obs_count=0,
         prompt_chars=80,
     )
@@ -176,15 +180,15 @@ async def test_guard_retries_without_rejected_target_and_preserves_fact() -> Non
         "hindsight_api.engine.consolidation.consolidator._consolidate_batch_with_llm",
         call,
     ):
-        result = await _consolidate_batch_with_identity_guard(
+        result = await _consolidate_batch_with_protected_vocabularies(
             llm_config=object(),
-            memories=[{"id": _PACKAGE_SOURCE_ID, "text": _PACKAGE_SOURCE}],
-            union_observations=[_observation(_PACKAGE_TARGET_ID, _PACKAGE_TARGET)],
+            memories=[{"id": _ENVIRONMENT_SOURCE_ID, "text": _ENVIRONMENT_SOURCE}],
+            union_observations=[_observation(_ENVIRONMENT_TARGET_ID, _ENVIRONMENT_TARGET)],
             union_source_facts={},
             config=types.SimpleNamespace(consolidation_max_attempts=3),
             remaining_observation_slots=None,
             max_observations_per_scope=-1,
-            identity_axes=_axes(),
+            protected_vocabularies=_vocabularies(),
             perf=perf,
         )
 
@@ -198,9 +202,9 @@ async def test_guard_exhaustion_fails_closed() -> None:
     bad = _BatchLLMResult(
         updates=[
             _UpdateAction(
-                observation_id=_PACKAGE_TARGET_ID,
-                source_fact_ids=[_PACKAGE_SOURCE_ID],
-                text="Bad cross-package merge.",
+                observation_id=_ENVIRONMENT_TARGET_ID,
+                source_fact_ids=[_ENVIRONMENT_SOURCE_ID],
+                text="Bad cross-environment merge.",
             )
         ]
     )
@@ -210,15 +214,15 @@ async def test_guard_exhaustion_fails_closed() -> None:
         "hindsight_api.engine.consolidation.consolidator._consolidate_batch_with_llm",
         call,
     ):
-        result = await _consolidate_batch_with_identity_guard(
+        result = await _consolidate_batch_with_protected_vocabularies(
             llm_config=object(),
-            memories=[{"id": _PACKAGE_SOURCE_ID, "text": _PACKAGE_SOURCE}],
-            union_observations=[_observation(_PACKAGE_TARGET_ID, _PACKAGE_TARGET)],
+            memories=[{"id": _ENVIRONMENT_SOURCE_ID, "text": _ENVIRONMENT_SOURCE}],
+            union_observations=[_observation(_ENVIRONMENT_TARGET_ID, _ENVIRONMENT_TARGET)],
             union_source_facts={},
             config=types.SimpleNamespace(consolidation_max_attempts=2),
             remaining_observation_slots=None,
             max_observations_per_scope=-1,
-            identity_axes=_axes(),
+            protected_vocabularies=_vocabularies(),
             perf=None,
         )
 
@@ -229,8 +233,8 @@ async def test_guard_exhaustion_fails_closed() -> None:
 
 async def test_dedup_skips_incompatible_best_candidate_before_llm() -> None:
     candidate = RetrievalResult(
-        id=_PACKAGE_TARGET_ID,
-        text=_PACKAGE_TARGET,
+        id=_ENVIRONMENT_TARGET_ID,
+        text=_ENVIRONMENT_TARGET,
         fact_type="observation",
         similarity=0.999,
     )
@@ -248,11 +252,11 @@ async def test_dedup_skips_incompatible_best_candidate_before_llm() -> None:
             bank_id="bank",
             config=types.SimpleNamespace(consolidation_dedup_threshold=0.97),
             dedup_llm_config=llm,
-            anchor_text=_PACKAGE_SOURCE,
+            anchor_text=_ENVIRONMENT_SOURCE,
             anchor_emb_str="[0.1, 0.2]",
             tags=["project:pale-meridian"],
             exclude_id=None,
-            identity_axes=_axes(),
+            protected_vocabularies=_vocabularies(),
         )
 
     assert outcome.best_id is None
@@ -261,15 +265,15 @@ async def test_dedup_skips_incompatible_best_candidate_before_llm() -> None:
 
 async def test_dedup_can_select_compatible_candidate_after_rejected_twin() -> None:
     incompatible = RetrievalResult(
-        id=_PACKAGE_TARGET_ID,
-        text=_PACKAGE_TARGET,
+        id=_ENVIRONMENT_TARGET_ID,
+        text=_ENVIRONMENT_TARGET,
         fact_type="observation",
         similarity=0.999,
     )
     compatible_id = "11111111-1111-4111-8111-111111111111"
     compatible = RetrievalResult(
         id=compatible_id,
-        text="The moonlight-analysis package completed its source-root split.",
+        text="The staging environment completed its source-root split.",
         fact_type="observation",
         similarity=0.98,
     )
@@ -298,84 +302,84 @@ async def test_dedup_can_select_compatible_candidate_after_rejected_twin() -> No
                 llm_temperature_consolidation=0.2,
             ),
             dedup_llm_config=llm,
-            anchor_text=_PACKAGE_SOURCE,
+            anchor_text=_ENVIRONMENT_SOURCE,
             anchor_emb_str="[0.1, 0.2]",
             tags=["project:pale-meridian"],
             exclude_id=None,
-            identity_axes=_axes(),
+            protected_vocabularies=_vocabularies(),
         )
 
     assert outcome.best_id == compatible_id
     prompt = llm.call.await_args.kwargs["messages"][0]["content"]
-    assert "moonlight-analysis package" in prompt
-    assert "melusine-world-schober" not in prompt
+    assert "staging environment" in prompt
+    assert "production" not in prompt
 
 
-def test_typed_identity_vocabulary_is_revalidated() -> None:
-    malformed = ConsolidationIdentityAxis(name="", tokens=("only-one",))
+def test_typed_protected_vocabulary_is_revalidated() -> None:
+    malformed = ConsolidationProtectedVocabulary(name="", terms=("only-one",))
 
     with pytest.raises(ValueError):
-        parse_consolidation_identity_axes((malformed,))
+        parse_consolidation_protected_vocabularies((malformed,))
 
 
-def test_identity_matching_uses_unicode_boundaries() -> None:
-    smuggled = f"{_PACKAGE_SOURCE} αmelusine-world-schoberβ"
+def test_protected_term_matching_uses_unicode_boundaries() -> None:
+    smuggled = f"{_ENVIRONMENT_SOURCE} αproductionβ"
 
-    conflicts = _identity_conflicts(smuggled, _PACKAGE_TARGET, _axes())
+    conflicts = _protected_vocabulary_conflicts(smuggled, _ENVIRONMENT_TARGET, _vocabularies())
 
     assert len(conflicts) == 1
-    assert conflicts[0].source_tokens == ("moonlight-analysis",)
+    assert conflicts[0].source_terms == ("staging",)
 
 
-def test_identity_matching_normalizes_multicodepoint_casefolds() -> None:
-    axes = _compile_identity_axes(
-        parse_consolidation_identity_axes([{"name": "package", "tokens": ["Straße", "melusine-world-schober"]}])
+def test_protected_term_matching_normalizes_multicodepoint_casefolds() -> None:
+    vocabularies = _compile_protected_vocabularies(
+        parse_consolidation_protected_vocabularies([{"name": "environment", "terms": ["Straße", "production"]}])
     )
 
-    conflicts = _identity_conflicts("The Straße package changed.", _PACKAGE_TARGET, axes)
+    conflicts = _protected_vocabulary_conflicts("The Straße environment changed.", _ENVIRONMENT_TARGET, vocabularies)
 
     assert len(conflicts) == 1
-    assert conflicts[0].source_tokens == ("strasse",)
+    assert conflicts[0].source_terms == ("strasse",)
 
 
-def test_update_proposed_text_cannot_change_compatible_target_identity() -> None:
-    target = "The moonlight-analysis package owns the extraction pipeline."
+def test_update_proposed_text_cannot_change_compatible_target_term() -> None:
+    target = "The staging environment owns the extraction pipeline."
     result = _BatchLLMResult(
         updates=[
             _UpdateAction(
-                observation_id=_PACKAGE_TARGET_ID,
-                source_fact_ids=[_PACKAGE_SOURCE_ID],
-                text=_PACKAGE_TARGET,
+                observation_id=_ENVIRONMENT_TARGET_ID,
+                source_fact_ids=[_ENVIRONMENT_SOURCE_ID],
+                text=_ENVIRONMENT_TARGET,
             )
         ]
     )
 
-    violations = _find_identity_violations(
+    violations = _find_protected_vocabulary_violations(
         result,
-        [{"id": _PACKAGE_SOURCE_ID, "text": _PACKAGE_SOURCE}],
-        [_observation(_PACKAGE_TARGET_ID, target)],
-        _axes(),
+        [{"id": _ENVIRONMENT_SOURCE_ID, "text": _ENVIRONMENT_SOURCE}],
+        [_observation(_ENVIRONMENT_TARGET_ID, target)],
+        _vocabularies(),
     )
 
     assert violations
     assert all(violation.action == "update" for violation in violations)
 
 
-def test_create_text_cannot_spoof_its_source_identity() -> None:
+def test_create_text_cannot_spoof_its_source_term() -> None:
     result = _BatchLLMResult(
         creates=[
             _CreateAction(
-                text=_PACKAGE_TARGET,
-                source_fact_ids=[_PACKAGE_SOURCE_ID],
+                text=_ENVIRONMENT_TARGET,
+                source_fact_ids=[_ENVIRONMENT_SOURCE_ID],
             )
         ]
     )
 
-    violations = _find_identity_violations(
+    violations = _find_protected_vocabulary_violations(
         result,
-        [{"id": _PACKAGE_SOURCE_ID, "text": _PACKAGE_SOURCE}],
+        [{"id": _ENVIRONMENT_SOURCE_ID, "text": _ENVIRONMENT_SOURCE}],
         [],
-        _axes(),
+        _vocabularies(),
     )
 
     assert len(violations) == 1
@@ -389,13 +393,13 @@ def test_fresh_process_median_decision_remains_lawful() -> None:
         "variance is real; a single attractive row is not performance evidence."
     )
 
-    assert _identity_conflicts(source, _BENCHMARK_TARGET, _axes()) == ()
+    assert _protected_vocabulary_conflicts(source, _UNKNOWN_TARGET, _vocabularies()) == ()
 
 
-async def test_dedup_uses_source_identity_when_generated_anchor_is_unknown() -> None:
+async def test_dedup_uses_source_term_when_generated_anchor_is_unknown() -> None:
     candidate = RetrievalResult(
-        id=_PACKAGE_TARGET_ID,
-        text=_PACKAGE_TARGET,
+        id=_ENVIRONMENT_TARGET_ID,
+        text=_ENVIRONMENT_TARGET,
         fact_type="observation",
         similarity=0.999,
     )
@@ -417,22 +421,22 @@ async def test_dedup_uses_source_identity_when_generated_anchor_is_unknown() -> 
             anchor_emb_str="[0.1, 0.2]",
             tags=[],
             exclude_id=None,
-            identity_axes=_axes(),
-            identity_evidence=(_PACKAGE_SOURCE,),
+            protected_vocabularies=_vocabularies(),
+            protected_evidence=(_ENVIRONMENT_SOURCE,),
         )
 
     assert outcome.should_merge is False
     llm.call.assert_not_called()
 
 
-async def test_dedup_rejects_identity_drift_in_merged_text() -> None:
+async def test_dedup_rejects_protected_term_drift_in_merged_text() -> None:
     candidate = RetrievalResult(
         id="11111111-1111-4111-8111-111111111111",
-        text="The moonlight-analysis package completed its source-root split.",
+        text="The staging environment completed its source-root split.",
         fact_type="observation",
         similarity=0.99,
     )
-    llm = types.SimpleNamespace(call=AsyncMock(return_value=_DedupDecision(action="merge", text=_PACKAGE_TARGET)))
+    llm = types.SimpleNamespace(call=AsyncMock(return_value=_DedupDecision(action="merge", text=_ENVIRONMENT_TARGET)))
 
     with (
         patch(
@@ -455,12 +459,12 @@ async def test_dedup_rejects_identity_drift_in_merged_text() -> None:
                 llm_temperature_consolidation=0.2,
             ),
             dedup_llm_config=llm,
-            anchor_text=_PACKAGE_SOURCE,
+            anchor_text=_ENVIRONMENT_SOURCE,
             anchor_emb_str="[0.1, 0.2]",
             tags=[],
             exclude_id=None,
-            identity_axes=_axes(),
-            identity_evidence=(_PACKAGE_SOURCE,),
+            protected_vocabularies=_vocabularies(),
+            protected_evidence=(_ENVIRONMENT_SOURCE,),
         )
 
     assert outcome.should_merge is False
@@ -468,8 +472,8 @@ async def test_dedup_rejects_identity_drift_in_merged_text() -> None:
 
 async def test_incompatible_create_reconciliation_performs_no_write() -> None:
     candidate = RetrievalResult(
-        id=_PACKAGE_TARGET_ID,
-        text=_PACKAGE_TARGET,
+        id=_ENVIRONMENT_TARGET_ID,
+        text=_ENVIRONMENT_TARGET,
         fact_type="observation",
         similarity=0.999,
     )
@@ -495,11 +499,11 @@ async def test_incompatible_create_reconciliation_performs_no_write() -> None:
             config=types.SimpleNamespace(consolidation_dedup_threshold=0.97),
             dedup_llm_config=llm,
             create_text="A source-root split was completed.",
-            create_source_ids=[uuid.UUID(_PACKAGE_SOURCE_ID)],
+            create_source_ids=[uuid.UUID(_ENVIRONMENT_SOURCE_ID)],
             tags=[],
             source_bounds=_TemporalBounds(),
-            identity_axes=_axes(),
-            source_identity_texts=(_PACKAGE_SOURCE,),
+            protected_vocabularies=_vocabularies(),
+            source_protected_texts=(_ENVIRONMENT_SOURCE,),
         )
 
     assert merged_into is None
@@ -509,8 +513,8 @@ async def test_incompatible_create_reconciliation_performs_no_write() -> None:
 
 async def test_incompatible_update_reconciliation_performs_no_write() -> None:
     candidate = RetrievalResult(
-        id=_PACKAGE_TARGET_ID,
-        text=_PACKAGE_TARGET,
+        id=_ENVIRONMENT_TARGET_ID,
+        text=_ENVIRONMENT_TARGET,
         fact_type="observation",
         similarity=0.999,
     )
@@ -533,8 +537,8 @@ async def test_incompatible_update_reconciliation_performs_no_write() -> None:
             updated_text="A source-root split was completed.",
             updated_emb_str="[0.1, 0.2]",
             tags=[],
-            identity_axes=_axes(),
-            identity_evidence=(_PACKAGE_SOURCE,),
+            protected_vocabularies=_vocabularies(),
+            protected_evidence=(_ENVIRONMENT_SOURCE,),
         )
 
     conn.execute.assert_not_called()
@@ -545,9 +549,9 @@ async def test_guard_fails_when_retry_omits_displaced_source_at_zero_capacity() 
     bad = _BatchLLMResult(
         updates=[
             _UpdateAction(
-                observation_id=_PACKAGE_TARGET_ID,
-                source_fact_ids=[_PACKAGE_SOURCE_ID],
-                text="Bad cross-package merge.",
+                observation_id=_ENVIRONMENT_TARGET_ID,
+                source_fact_ids=[_ENVIRONMENT_SOURCE_ID],
+                text="Bad cross-environment merge.",
             )
         ]
     )
@@ -557,15 +561,15 @@ async def test_guard_fails_when_retry_omits_displaced_source_at_zero_capacity() 
         "hindsight_api.engine.consolidation.consolidator._consolidate_batch_with_llm",
         call,
     ):
-        result = await _consolidate_batch_with_identity_guard(
+        result = await _consolidate_batch_with_protected_vocabularies(
             llm_config=object(),
-            memories=[{"id": _PACKAGE_SOURCE_ID, "text": _PACKAGE_SOURCE}],
-            union_observations=[_observation(_PACKAGE_TARGET_ID, _PACKAGE_TARGET)],
+            memories=[{"id": _ENVIRONMENT_SOURCE_ID, "text": _ENVIRONMENT_SOURCE}],
+            union_observations=[_observation(_ENVIRONMENT_TARGET_ID, _ENVIRONMENT_TARGET)],
             union_source_facts={},
             config=types.SimpleNamespace(consolidation_max_attempts=2),
             remaining_observation_slots=0,
             max_observations_per_scope=1,
-            identity_axes=_axes(),
+            protected_vocabularies=_vocabularies(),
             perf=None,
         )
 

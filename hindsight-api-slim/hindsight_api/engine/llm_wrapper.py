@@ -29,11 +29,6 @@ from ..config import (
     ENV_REFLECT_LLM_MAX_CONCURRENT,
     ENV_RETAIN_LLM_MAX_CONCURRENT,
 )
-from ..llm_provider_metadata import (
-    get_default_model_for_provider,
-    get_llm_provider_metadata,
-    requires_api_key,
-)
 from .cache_affinity import parse_cache_affinity
 from .llm_interface import (
     LLM_TOOL_CHOICE_AUTO,
@@ -313,6 +308,31 @@ def parse_llm_json(raw: str) -> Any:
         return repaired
 
 
+_PROVIDERS_WITHOUT_API_KEY = frozenset(
+    {
+        "ollama",
+        "lmstudio",
+        "llamacpp",
+        "openai-codex",
+        "claude-code",
+        "github-copilot",
+        "mock",
+        "none",
+        "vertexai",
+        "litellm",
+        "litellmrouter",
+        "bedrock",
+        "nous",
+        "xai-oauth",
+    }
+)
+
+
+def requires_api_key(provider: str) -> bool:
+    """Return True if the given provider requires an API key to operate."""
+    return provider.lower() not in _PROVIDERS_WITHOUT_API_KEY
+
+
 def _validate_ollama_num_ctx(value: Any) -> int | None:
     """Validate a native Ollama context-window override."""
     if value is None:
@@ -389,16 +409,15 @@ def create_llm_provider(
         vertexai_region: Vertex AI region (for VertexAI provider).
         vertexai_credentials: Vertex AI credentials object (for VertexAI provider).
         timeout: Per-request LLM timeout in seconds (resolved by the caller from the
-            per-operation/global config). Threaded into Anthropic, Gemini/VertexAI,
-            LiteLLM, LiteLLM Router, OpenAI-compatible, Fireworks, and Nous providers.
-            ``None`` lets each provider apply its own default.
+            per-operation/global config). Threaded into the providers that honour a
+            configurable request timeout (LiteLLM, LiteLLM Router, OpenAI-compatible,
+            Nous). ``None`` lets each provider fall back to its own default
+            (``HINDSIGHT_API_LLM_TIMEOUT`` / ``DEFAULT_LLM_TIMEOUT`` for those four;
+            Anthropic and Gemini keep their provider-specific defaults).
 
     Returns:
         LLMInterface implementation for the specified provider.
     """
-    metadata = get_llm_provider_metadata(provider)
-    provider_lower = metadata.provider_id
-    base_url = base_url or metadata.default_base_url
     ollama_num_ctx = _validate_ollama_num_ctx(ollama_num_ctx)
 
     from .providers import (
@@ -417,6 +436,7 @@ def create_llm_provider(
         OpenAIResponsesLLM,
     )
 
+    provider_lower = provider.lower()
     if provider_lower == "gemini":
         from ..config import parse_gemini_service_tier
 
@@ -485,8 +505,6 @@ def create_llm_provider(
             gemini_service_tier=gemini_service_tier,
             prompt_cache_enabled=prompt_cache_enabled,
             extra_body=extra_body,
-            default_headers=default_headers,
-            timeout=timeout,
         )
 
     elif provider_lower == "anthropic":
@@ -498,7 +516,6 @@ def create_llm_provider(
             reasoning_effort=reasoning_effort,
             default_headers=default_headers,
             extra_body=extra_body,
-            timeout=timeout,
         )
 
     elif provider_lower == "litellm":
@@ -583,7 +600,6 @@ def create_llm_provider(
             extra_body=extra_body,
             default_headers=default_headers,
             cache_affinity=cache_affinity,
-            timeout=timeout,
         )
 
     elif provider_lower == "nous":
@@ -639,7 +655,21 @@ def create_llm_provider(
             timeout=timeout,
         )
 
-    elif metadata.openai_compatible:
+    elif provider_lower in (
+        "openai",
+        "groq",
+        "ollama",
+        "ollama-cloud",
+        "lmstudio",
+        "minimax",
+        "deepseek",
+        "volcano",
+        "openrouter",
+        "requesty",
+        "zai",
+        "opencode-go",
+        "atlas",
+    ):
         return OpenAICompatibleLLM(
             provider=provider,
             api_key=api_key,
@@ -743,17 +773,16 @@ class LLMProvider:
                 instead of ``response_format``, for the LiteLLM-backed providers - from
                 config (``HINDSIGHT_API_LLM_STRUCTURED_OUTPUT_FORCED_TOOL``).
 
-        This constructor reads no global ``HindsightConfig``. It normalizes the
-        provider ID and empty base URL from canonical static provider metadata,
-        then uses all operation-specific arguments as passed. Resolving server-level
-        defaults for other ``None`` arguments remains the caller's responsibility
-        (see ``MemoryEngine``'s per-op builds, ``_member_to_llm``, and
-        ``LLMProvider.from_env``).
+        This constructor uses every argument as passed and does not read global
+        ``HindsightConfig``: resolving the server-level default for a ``None`` argument is the
+        caller's responsibility (see ``MemoryEngine``'s per-op builds, ``_member_to_llm``, and
+        ``LLMProvider.from_env``). Keeping it config-free makes a provider's effective settings a
+        pure function of its arguments — which is what lets each member of a multi-LLM chain be
+        configured independently.
         """
-        metadata = get_llm_provider_metadata(provider)
-        self.provider = metadata.provider_id
+        self.provider = provider.lower()
         self.api_key = api_key
-        self.base_url = base_url or metadata.default_base_url
+        self.base_url = base_url
         self.model = model
         self.reasoning_effort = reasoning_effort
         # Per-request timeout (seconds). Used verbatim — the caller resolves the
@@ -793,6 +822,68 @@ class LLMProvider:
         # it — the setting has no visible effect in the response, so a silent
         # fallback to "none" would be indistinguishable from it working.
         self.cache_affinity = parse_cache_affinity(cache_affinity).value
+
+        # Validate provider
+        valid_providers = [
+            "openai",
+            "openai-responses",
+            "groq",
+            "ollama",
+            "ollama-cloud",
+            "gemini",
+            "anthropic",
+            "lmstudio",
+            "llamacpp",
+            "vertexai",
+            "openai-codex",
+            "claude-code",
+            "github-copilot",
+            "mock",
+            "none",
+            "minimax",
+            "deepseek",
+            "litellm",
+            "litellmrouter",
+            "bedrock",
+            "volcano",
+            "openrouter",
+            "requesty",
+            "zai",
+            "opencode-go",
+            "atlas",
+            "fireworks",
+            "nous",
+            "xai-oauth",
+        ]
+        if self.provider not in valid_providers:
+            raise ValueError(f"Invalid LLM provider: {self.provider}. Must be one of: {', '.join(valid_providers)}")
+
+        # Set default base URLs
+        if not self.base_url:
+            if self.provider == "groq":
+                self.base_url = "https://api.groq.com/openai/v1"
+            elif self.provider == "ollama":
+                self.base_url = "http://localhost:11434/v1"
+            elif self.provider == "ollama-cloud":
+                self.base_url = "https://ollama.com/v1"
+            elif self.provider == "lmstudio":
+                self.base_url = "http://localhost:1234/v1"
+            elif self.provider == "minimax":
+                self.base_url = "https://api.minimax.io/v1"
+            elif self.provider == "deepseek":
+                self.base_url = "https://api.deepseek.com"
+            elif self.provider == "openrouter":
+                self.base_url = "https://openrouter.ai/api/v1"
+            elif self.provider == "requesty":
+                self.base_url = "https://router.requesty.ai/v1"
+            elif self.provider == "zai":
+                self.base_url = "https://api.z.ai/api/coding/paas/v4"
+            elif self.provider == "opencode-go":
+                self.base_url = "https://opencode.ai/zen/go/v1"
+            elif self.provider == "atlas":
+                self.base_url = "https://api.atlascloud.ai/v1"
+            elif self.provider == "nous":
+                self.base_url = "https://inference-api.nousresearch.com/v1"
 
         # Prepare Vertex AI config (if applicable). Values are used as passed; the
         # caller resolves the global-config fallback (MemoryEngine builds /
@@ -1461,6 +1552,7 @@ class LLMProvider:
             ENV_LLM_VERTEXAI_PROJECT_ID,
             ENV_LLM_VERTEXAI_REGION,
             ENV_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY,
+            _get_default_model_for_provider,
             _parse_boolean_env,
             _parse_llm_router_config,
             _parse_optional_positive_int,
@@ -1476,7 +1568,7 @@ class LLMProvider:
             raise ValueError(f"{ENV_LLM_API_KEY} environment variable is required for provider '{provider}'")
 
         base_url = os.getenv(ENV_LLM_BASE_URL, "")
-        model = os.getenv(ENV_LLM_MODEL) or get_default_model_for_provider(provider)
+        model = os.getenv(ENV_LLM_MODEL) or _get_default_model_for_provider(provider)
         extra_body = json.loads(os.getenv(ENV_LLM_EXTRA_BODY, "null"))
         default_headers = json.loads(os.getenv(ENV_LLM_DEFAULT_HEADERS, "null"))
         # Same default as HindsightConfig.from_env: this entry point must not
