@@ -198,6 +198,51 @@ async def test_guard_retries_without_rejected_target_and_preserves_fact() -> Non
     assert perf.llm_calls == 2
 
 
+async def test_guard_real_worker_keeps_vocabulary_retries_at_the_outer_boundary() -> None:
+    attempts = 0
+
+    async def call(**kwargs: object) -> object:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("transient provider failure")
+        response_format = kwargs["response_format"]
+        return response_format(creates=[], updates=[], deletes=[])
+
+    llm = types.SimpleNamespace(call=AsyncMock(side_effect=call))
+    perf = ConsolidationPerfLog("bank")
+    config = types.SimpleNamespace(
+        consolidation_max_attempts=2,
+        consolidation_llm_max_retries=0,
+        llm_output_language=None,
+        observations_mission=None,
+        llm_supports_max_items=True,
+        llm_temperature_consolidation=0.0,
+        llm_strict_schema_consolidation=False,
+        consolidation_max_completion_tokens=None,
+    )
+
+    with patch(
+        "hindsight_api.engine.consolidation.consolidator.asyncio.sleep",
+        new=AsyncMock(),
+    ):
+        result = await _consolidate_batch_with_protected_vocabularies(
+            llm_config=llm,
+            memories=[{"id": _ENVIRONMENT_SOURCE_ID, "text": _ENVIRONMENT_SOURCE}],
+            union_observations=[],
+            union_source_facts={},
+            config=config,
+            remaining_observation_slots=None,
+            max_observations_per_scope=-1,
+            protected_vocabularies=_vocabularies(),
+            perf=perf,
+        )
+
+    assert result.failed is False
+    assert llm.call.await_count == 2
+    assert perf.llm_calls == 2
+
+
 async def test_guard_exhaustion_fails_closed() -> None:
     bad = _BatchLLMResult(
         updates=[

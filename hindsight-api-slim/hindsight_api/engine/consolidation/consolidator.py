@@ -3166,6 +3166,7 @@ async def _consolidate_batch_with_llm(
     config: Any,
     remaining_observation_slots: int | None = None,
     max_observations_per_scope: int = -1,
+    max_attempts_override: int | None = None,
 ) -> _BatchLLMResult:
     """Single LLM call for a batch of facts against a pooled set of observations."""
     if config is None:
@@ -3244,7 +3245,7 @@ async def _consolidate_batch_with_llm(
         supports_max_items=config.llm_supports_max_items,
     )
 
-    max_attempts = config.consolidation_max_attempts
+    max_attempts = max_attempts_override if max_attempts_override is not None else config.consolidation_max_attempts
     inner_max_retries = config.consolidation_llm_max_retries
     last_exc: Exception | None = None
     attempts_made = 0
