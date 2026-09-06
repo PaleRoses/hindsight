@@ -26,9 +26,8 @@ export interface KnowledgeNode {
   /** The page's EFFECTIVE refresh policy, on servers new enough to report it (#3572). Absent
    *  everywhere else, which `seedPages()` reads as "unknown, leave it alone". */
   trigger?: { tags_match?: string };
-  /** Pages only: a memory in this page's scope has been written since the page last read the
-   *  memories, so the server already knows the document is behind its own corpus. Absent on
-   *  folders, and on servers that predate the flag. */
+  /** Pages only: an in-scope memory was written since the page last read them, so the server
+   *  already knows the document is behind its corpus. Absent on folders and on older servers. */
   is_stale?: boolean | null;
   children?: KnowledgeNode[];
 }
@@ -441,26 +440,14 @@ export class HindsightClient {
     await this.req("DELETE", this.bankUrl(`/documents/${encodeURIComponent(documentId)}`));
   }
 
-  /** Count of operations still ACTIVE on this bank. Powers syncStatus's "extractions drained" check.
-   *
-   *  The list endpoint pages — default 20, hard max 100, newest first — over a table that reaches
-   *  five figures on a busy bank, so filtering one page counts "non-terminal among the newest 20"
-   *  and silently saturates at 20. Let the server count instead: `active_only=true` narrows the
-   *  endpoint's own `total` to the non-terminal rows, so one `limit=1` probe is exact at any
-   *  backlog depth and cheaper than a page.
-   *
-   *  ONE request, and not one per non-terminal status: two counts are taken at two different
-   *  instants, so an operation that moves `pending` → `processing` between them is missed by both
-   *  (the `processing` count runs while it is still pending, the `pending` count after it has
-   *  moved) and the pair sums to zero while the bank is still working. A single count cannot
-   *  straddle that transition.
-   *
-   *  A server too old to know the flag ignores it and returns the whole table's total — an
-   *  OVERCOUNT, which reads as "still busy"; it can never fake a drained bank, and the caller's
-   *  settle loop stops on a count that is no longer falling.
-   *
-   *  A pending op deferred far into the future (a deliberately held retry backlog) counts as active
-   *  here — the endpoint exposes no next_retry_at filter, so "active" means "not yet terminal". */
+  /** Count of operations still ACTIVE on this bank. Powers syncStatus's "extractions drained"
+   *  check. `active_only=true` narrows the endpoint's own `total`, so one `limit=1` probe is exact
+   *  at any backlog depth — where filtering a page saturates at its 20 rows, and a count per
+   *  non-terminal status is taken at two instants, so an op moving `pending` → `processing`
+   *  between them is missed by both and the pair reads zero on a working bank. A server too old
+   *  for the flag returns the whole table's total: an OVERCOUNT, which can never fake a drain.
+   *  A pending op deferred into the future (a held retry backlog) counts as active: the endpoint
+   *  exposes no next_retry_at filter, so "active" means "not yet terminal". */
   async activeOperations(): Promise<number> {
     try {
       const r = await this.req("GET", this.bankUrl("/operations?active_only=true&limit=1"));
@@ -589,10 +576,8 @@ export class HindsightClient {
             name: n.name,
             ...(n.description ? { description: n.description } : {}),
             ...(folder ? { folder } : {}),
-            // Carried, not dropped: the roster this feeds is the only place most agents ever
-            // learn a page exists, so it is also the only place they can be told it is behind.
-            // Omitted rather than defaulted when the server does not report it — absent means
-            // "unknown", which must not render as "current".
+            // Absent rather than false where the server said nothing: "unknown" must not render
+            // as "current" in the roster this feeds.
             ...(typeof n.is_stale === "boolean" ? { is_stale: n.is_stale } : {}),
           });
         }

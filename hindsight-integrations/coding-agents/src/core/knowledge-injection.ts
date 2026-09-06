@@ -1,9 +1,8 @@
 export interface PageRef {
   id: string;
   title: string;
-  /** The server's own staleness verdict for this page: in-scope memories have been written since
-   *  it was last rebuilt. Undefined means the server did not say — rendered as nothing, never as
-   *  "current". */
+  /** The server's own staleness verdict: in-scope memories written since the page was rebuilt.
+   *  Undefined means the server did not say — rendered as nothing, never as "current". */
   stale?: boolean;
 }
 

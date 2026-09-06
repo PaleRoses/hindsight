@@ -2456,9 +2456,7 @@ async def _do_get_knowledge_page(
         "tags": page.display_tags,
         "timestamp": node.get("last_refreshed_at") or node.get("created_at"),
         "markdown": page_markdown.render_document(node),
-        # Whether the server already knows this document is behind its own corpus. The reader
-        # is the one who can act on that — by verifying a claim against the source instead of
-        # trusting it — so it travels with the document rather than only with the tree.
+        # Travels with the document, not only with the tree: its reader is who can act on it.
         "is_stale": node.get("is_stale"),
     }
 
@@ -3958,9 +3956,8 @@ def _register_list_operations(mcp: FastMCP, memory: MemoryEngine, config: MCPToo
             Args:
                 status: Filter by status: 'pending', 'running', 'completed', 'failed', 'cancelled'
                 limit: Maximum number of results (default: 20)
-                active_only: Only operations that are still pending or processing. The response
-                    'total' counts the same set, so it reports the whole active backlog even when
-                    'limit' returns fewer rows.
+                active_only: Only operations still pending or processing. The response 'total'
+                    counts the same set, so it reports the whole backlog even at a small 'limit'.
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
             return await _run_tool(
@@ -3987,9 +3984,8 @@ def _register_list_operations(mcp: FastMCP, memory: MemoryEngine, config: MCPToo
             Args:
                 status: Filter by status: 'pending', 'running', 'completed', 'failed', 'cancelled'
                 limit: Maximum number of results (default: 20)
-                active_only: Only operations that are still pending or processing. The response
-                    'total' counts the same set, so it reports the whole active backlog even when
-                    'limit' returns fewer rows.
+                active_only: Only operations still pending or processing. The response 'total'
+                    counts the same set, so it reports the whole backlog even at a small 'limit'.
             """
             return await _run_tool(
                 config,

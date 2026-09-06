@@ -403,6 +403,27 @@ class TestTree:
             assert page["is_stale"] == model["is_stale"], page["name"]
 
     @pytest.mark.memory_backend_incompatible
+    async def test_a_page_read_reports_its_own_staleness(self, api_client, memory, kb_bank):
+        """A page read answers its own staleness, agreeing with the tree in both states.
+
+        A reader who cannot tell a current document from a known-stale one trusts both equally.
+        """
+        bank_id, ids = kb_bank
+        page_url = f"/v1/default/banks/{_enc(bank_id)}/knowledge-base/pages/{ids.orders}"
+        tree_url = f"/v1/default/banks/{_enc(bank_id)}/knowledge-base/tree"
+
+        async def _verdicts() -> tuple[bool, bool]:
+            page = (await api_client.get(page_url)).json()
+            roots = {r["name"]: r for r in (await api_client.get(tree_url)).json()["roots"]}
+            orders = next(c for c in roots["Runbooks"]["children"] if c["name"] == "Orders")
+            return page["is_stale"], orders["is_stale"]
+
+        assert await _verdicts() == (False, False)
+        # Every one of Orders' tags, so the write lands in its scope (all_strict is a superset test).
+        await self._insert_memory(memory, bank_id, ["type:runbook", "sales", "revenue"])
+        assert await _verdicts() == (True, True)
+
+    @pytest.mark.memory_backend_incompatible
     async def test_tree_asks_once_for_the_whole_tree(self, api_client, memory, kb_bank):
         """Per-page answers, but not a query per page — the tree view polls."""
         bank_id, ids = kb_bank
@@ -754,43 +775,6 @@ class TestGetPage:
         # declares no such field, so the key must be absent rather than present-and-null.
         assert "\n# Orders" in page["markdown"]
         assert "body" not in page
-
-    async def test_reports_staleness_and_agrees_with_the_tree(self, api_client, kb_bank):
-        """The reader of a page is who can act on the page being behind.
-
-        The tree has always answered this per page; the single-page read answered nothing, so an
-        agent that read a document had no way to tell a current one from one the server already
-        knew was stale. Both surfaces resolve the same scope, so they must not disagree.
-        """
-        bank_id, ids = kb_bank
-        page = (await api_client.get(f"/v1/default/banks/{_enc(bank_id)}/knowledge-base/pages/{ids.orders}")).json()
-        # Seeded with content and no memories written since: nothing in scope is newer.
-        assert page["is_stale"] is False
-
-        tree = (await api_client.get(f"/v1/default/banks/{_enc(bank_id)}/knowledge-base/tree")).json()
-        by_id = {}
-
-        def walk(nodes):
-            for n in nodes:
-                by_id[n["id"]] = n
-                walk(n.get("children") or [])
-
-        walk(tree["roots"])
-        assert by_id[ids.orders]["is_stale"] == page["is_stale"]
-
-    async def test_stale_page_is_reported_as_stale(self, api_client, memory, kb_bank, monkeypatch):
-        """The projection passes the engine's verdict through rather than flattening it."""
-        bank_id, ids = kb_bank
-        original = memory.get_knowledge_page
-
-        async def stale_node(**kwargs):
-            node = await original(**kwargs)
-            node["is_stale"] = True
-            return node
-
-        monkeypatch.setattr(memory, "get_knowledge_page", stale_node)
-        resp = await api_client.get(f"/v1/default/banks/{_enc(bank_id)}/knowledge-base/pages/{ids.orders}")
-        assert resp.json()["is_stale"] is True
 
     async def test_missing_page_404(self, api_client, kb_bank):
         bank_id, ids = kb_bank

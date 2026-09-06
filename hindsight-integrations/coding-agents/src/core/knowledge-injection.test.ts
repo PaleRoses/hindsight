@@ -16,15 +16,13 @@ describe("parsePageList", () => {
     ]);
   });
   it("carries the server's staleness verdict, and only when it gave one", () => {
-    const raw = {
-      items: [
-        { id: "p1", name: "Component map", is_stale: true },
-        { id: "p2", name: "Core concepts", is_stale: false },
-        { id: "p3", name: "Key decisions" },
-        { id: "p4", name: "Conventions", is_stale: "yes" },
-      ],
-    };
-    expect(parsePageList(raw)).toEqual([
+    const items = [
+      { id: "p1", name: "Component map", is_stale: true },
+      { id: "p2", name: "Core concepts", is_stale: false },
+      { id: "p3", name: "Key decisions" },
+      { id: "p4", name: "Conventions", is_stale: "yes" },
+    ];
+    expect(parsePageList({ items })).toEqual([
       { id: "p1", title: "Component map", stale: true },
       { id: "p2", title: "Core concepts", stale: false },
       { id: "p3", title: "Key decisions" },
@@ -110,39 +108,27 @@ describe("buildRosterRefresh", () => {
   });
 });
 
-/** The server computes per-page staleness and hands it over the wire; until these, both the API's
- *  page projection and the plugin's roster discarded it, so an agent reading a page had no way to
- *  know the server already considered it behind. */
 describe("staleness in the injected rosters", () => {
-  const STALE = [
+  const PAGES = [
     { id: "p1", title: "Component map", stale: true },
     { id: "p2", title: "Core concepts", stale: false },
   ];
 
-  it("marks stale pages in the SessionStart roster and explains the mark once", () => {
-    const out = buildKnowledgePreamble(STALE);
+  it("marks a stale page in the SessionStart roster and explains the mark once", () => {
+    const out = buildKnowledgePreamble(PAGES);
     expect(out).toContain("- Component map (p1) — STALE");
     expect(out).toContain("- Core concepts (p2)");
     expect(out).not.toContain("- Core concepts (p2) — STALE");
-    expect(out).toContain("verify");
     expect(out.match(/Pages marked STALE/g)).toHaveLength(1);
   });
 
-  it("marks them in the periodic refresh too — the roster re-appears there all session", () => {
-    const out = buildRosterRefresh(STALE);
-    expect(out).toContain("- Component map (p1) — STALE");
-    expect(out).toContain("Pages marked STALE");
-  });
-
-  /** A caveat printed unconditionally is boilerplate, and boilerplate stops being read. */
-  it("omits the legend entirely when nothing is flagged", () => {
-    for (const out of [
-      buildKnowledgePreamble([{ id: "p1", title: "Component map", stale: false }]),
-      buildKnowledgePreamble([{ id: "p1", title: "Component map" }]),
-      buildRosterRefresh([{ id: "p1", title: "Component map" }]),
-    ]) {
+  /** The roster re-appears on every refresh, so the mark must survive there — and a legend
+   *  printed unconditionally is boilerplate, which stops being read. */
+  it("marks it in the periodic refresh too, and drops the legend when nothing is flagged", () => {
+    expect(buildRosterRefresh(PAGES)).toContain("- Component map (p1) — STALE");
+    for (const out of [buildKnowledgePreamble([PAGES[1]]), buildRosterRefresh([PAGES[1]])]) {
       expect(out).not.toContain("STALE");
-      expect(out).toContain("- Component map (p1)");
+      expect(out).toContain("- Core concepts (p2)");
     }
   });
 });

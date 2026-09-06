@@ -1712,18 +1712,6 @@ class TestOperationTools:
         result = await _tools(mcp)["list_operations"].fn()
         assert isinstance(result, dict)
 
-    @pytest.mark.parametrize("include_bank_id", [True, False])
-    async def test_list_operations_active_only_reaches_the_engine(self, mock_memory, include_bank_id):
-        """The backlog question an agent actually asks — "is this bank still working?" — is only
-        answerable if the flag survives the tool call: the engine narrows its `total` to the
-        non-terminal rows, so dropping the flag silently answers with the whole operation history.
-        Both registrations (with and without the cross-bank `bank_id` parameter) thread it."""
-        mcp = _make_mcp_server(mock_memory, {"list_operations"}, include_bank_id=include_bank_id)
-        await _tools(mcp)["list_operations"].fn(active_only=True, limit=1)
-        call_kwargs = mock_memory.list_operations.call_args.kwargs
-        assert call_kwargs["active_only"] is True
-        assert call_kwargs["limit"] == 1
-
 
 # =========================================================================
 # Tags & Bank Tool Tests

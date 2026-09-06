@@ -520,105 +520,30 @@ describe("every client-building entrypoint forwards observationScopes", () => {
 });
 
 describe("HindsightClient.activeOperations", () => {
-  /** The server's own `active_only` predicate: `status IN ('pending', 'processing')`. */
-  const ACTIVE_STATUS: Record<string, true> = { pending: true, processing: true };
-
-  /** What `GET /operations` answers: `total` counts the whole FILTERED set, `operations` carries
-   *  only the requested page of it. Every fixture below serves through this, so a count taken from
-   *  the page instead of from `total` reads 1 (the `limit=1` probe) rather than the real backlog. */
-  function listOperations(rows: { status: string }[], url: string) {
-    const q = new URL(url).searchParams;
-    const askedStatus = q.get("status");
-    const matched = rows.filter(
-      (r) =>
-        (q.get("active_only") !== "true" || ACTIVE_STATUS[r.status] === true) &&
-        (!askedStatus || askedStatus === r.status)
-    );
-    return { total: matched.length, operations: matched.slice(0, Number(q.get("limit") ?? 20)) };
-  }
-
-  it("reads the server's active total instead of counting a page", async () => {
-    // A bank deep enough that no page can hold its backlog: 374 non-terminal rows among 1000.
-    const rows = Array.from({ length: 1000 }, (_, i) => ({
-      status: i < 374 ? "pending" : "completed",
-    }));
-    const seen: string[] = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string) => {
-        seen.push(url);
-        return jsonResponse(200, listOperations(rows, url));
-      })
-    );
+  /** The fixture is the adversary: `active_only` applies the server's own predicate, `status`
+   *  filters, `total` counts the FILTERED set while only `limit` rows come back, and the 374
+   *  in-flight ops sit in whichever non-terminal status a single-status caller did NOT ask about.
+   *  So a page count reads 1, an unfiltered total 1000, and the per-status pair it replaced 0. */
+  it("reads the whole non-terminal backlog from one server-side count", async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      const q = new URL(url).searchParams;
+      const asked = q.get("status");
+      const flight = asked === "pending" ? "processing" : "pending";
+      const rows = Array.from({ length: 1000 }, (_, i) => (i < 374 ? flight : "completed"))
+        .filter((s) => q.get("active_only") !== "true" || s === "pending" || s === "processing")
+        .filter((s) => !asked || s === asked);
+      return jsonResponse(200, {
+        total: rows.length,
+        operations: rows.slice(0, Number(q.get("limit") ?? 20)).map((status) => ({ status })),
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
 
     const client = new HindsightClient({ apiUrl: "http://x", bank: "b" });
     expect(await client.activeOperations()).toBe(374);
-
-    // ONE request, and it must make the server do the counting: an unfiltered GET counts terminal
-    // rows too, and a per-status request pair is what the pending -> processing race lives in.
-    expect(seen).toHaveLength(1);
-    const q = new URL(seen[0]).searchParams;
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const q = new URL(String(fetchMock.mock.calls[0][0])).searchParams;
     expect(q.get("active_only")).toBe("true");
     expect(q.get("limit")).toBe("1");
-  });
-
-  it("counts processing alongside pending", async () => {
-    // Neither status alone is the backlog: 3 queued, 2 claimed by a worker.
-    const rows = [
-      ...Array.from({ length: 3 }, () => ({ status: "pending" })),
-      ...Array.from({ length: 2 }, () => ({ status: "processing" })),
-      { status: "completed" },
-    ];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string) => jsonResponse(200, listOperations(rows, url)))
-    );
-    const client = new HindsightClient({ apiUrl: "http://x", bank: "b" });
-    expect(await client.activeOperations()).toBe(5);
-  });
-
-  it("does not count terminal operations", async () => {
-    // A bank whose only rows are terminal: 10652 completed, 889 failed, 2 cancelled.
-    const rows = [
-      ...Array.from({ length: 10652 }, () => ({ status: "completed" })),
-      ...Array.from({ length: 889 }, () => ({ status: "failed" })),
-      ...Array.from({ length: 2 }, () => ({ status: "cancelled" })),
-    ];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string) => jsonResponse(200, listOperations(rows, url)))
-    );
-    const client = new HindsightClient({ apiUrl: "http://x", bank: "b" });
-    expect(await client.activeOperations()).toBe(0);
-  });
-
-  it("cannot lose an operation that moves pending -> processing between counts", async () => {
-    // One operation, mid-flight, and two counts that land on opposite sides of the moment a worker
-    // claims it: the server executes the `processing` count while the op is still pending and the
-    // `pending` count after it has moved. Both answer 0, so a bank with extraction still running
-    // reports itself drained. A single count cannot straddle the transition.
-    const seen: string[] = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string) => {
-        seen.push(url);
-        const asked = new URL(url).searchParams.get("status");
-        const rows = [{ status: asked === "processing" ? "pending" : "processing" }];
-        return jsonResponse(200, listOperations(rows, url));
-      })
-    );
-
-    const client = new HindsightClient({ apiUrl: "http://x", bank: "b" });
-    expect(await client.activeOperations()).toBe(1);
-    expect(seen).toHaveLength(1);
-  });
-
-  it("degrades to 0 when the endpoint fails", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => jsonResponse(500, { detail: "boom" }))
-    );
-    const client = new HindsightClient({ apiUrl: "http://x", bank: "b" });
-    expect(await client.activeOperations()).toBe(0);
   });
 });

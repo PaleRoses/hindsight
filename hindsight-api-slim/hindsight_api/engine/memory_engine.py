@@ -17793,11 +17793,8 @@ class MemoryEngine(MemoryEngineInterface):
     ) -> dict[str, Any] | None:
         """Return a page node merged with its mental model's content (for markdown rendering).
 
-        The node also carries ``is_stale`` — whether a memory in this page's scope has been
-        written since the page last read the memories, the same question the refresh gate asks.
-        The tree reports it for every page; a caller that reads one page got no answer at all
-        until it did, which left the page's only consumer unable to tell a current document
-        from one the server already knows is behind.
+        The node also carries ``is_stale`` — the same verdict the tree reports per page, absent
+        when the page has no backing mental model.
         """
         await self._authenticate_tenant(request_context)
         if self._operation_validator and not _nested_operation_authorized.get():
@@ -17824,12 +17821,10 @@ class MemoryEngine(MemoryEngineInterface):
                 return None
             node = self._row_to_knowledge_node(row)
             node["content"] = row["mm_content"]
-            # Whoever is reading the page is exactly who needs to know it is behind its own
-            # corpus, and the join above already selects every column the scope resolver wants,
-            # so the answer costs one scoped existence check on a connection already held.
-            # The single-model check rather than the tree's batch one: it additionally asks
-            # whether the document still cites facts that have since been removed, which the
-            # batch variant skips only to keep the polling surfaces to a single round-trip.
+            # The SELECT above already returns every column the scope resolver wants, so this
+            # costs one scoped existence check on a connection already held. Single-model check
+            # rather than the tree's batch one: it also asks whether the document cites facts
+            # since removed, which the batch variant skips to stay at one round-trip.
             if row["mental_model_id"] is not None:
                 node["is_stale"] = await self.compute_mental_model_is_stale(
                     conn,
@@ -19053,10 +19048,9 @@ class MemoryEngine(MemoryEngineInterface):
             limit: Maximum number of operations to return (default 20)
             offset: Number of operations to skip (default 0)
             exclude_parents: If True, exclude parent batch operations (is_parent=True in result_metadata)
-            active_only: If True, return only operations that have not reached a terminal state
-                (status pending or processing). Applies to the returned `total` as well, so a
-                caller can read an exact backlog depth from one `limit=1` request instead of
-                summing a request per non-terminal status.
+            active_only: If True, return only operations that are not yet terminal (status pending
+                or processing). Narrows the returned `total` too, so one `limit=1` request reports
+                the exact backlog depth.
             request_context: Request context for authentication
 
         Returns:
