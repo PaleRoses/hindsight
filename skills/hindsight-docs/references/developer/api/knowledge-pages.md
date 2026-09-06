@@ -304,8 +304,7 @@ Returns the page rendered as a markdown document.
 document = client.get_knowledge_page(BANK_ID, page.page_id)
 
 print(document.type)      # "runbook" — from the type:runbook tag
-print(document.body)      # the synthesized markdown body
-print(document.markdown)  # YAML frontmatter + body
+print(document.markdown)  # YAML frontmatter + synthesized markdown body
 ```
 
 ### Node.js
@@ -315,8 +314,7 @@ print(document.markdown)  # YAML frontmatter + body
 const document = await client.getKnowledgePage(BANK_ID, page.page_id);
 
 console.log(document.type);      // "runbook" — from the type:runbook tag
-console.log(document.body);      // the synthesized markdown body
-console.log(document.markdown);  // YAML frontmatter + body
+console.log(document.markdown);  // YAML frontmatter + synthesized markdown body
 ```
 
 ### CLI
@@ -340,13 +338,11 @@ hindsight knowledge-base get-page "$BANK_ID" "$PAGE_ID"
   "description": "How is the API deployed?",
   "tags": ["ops"],
   "timestamp": "2026-08-03T09:12:44+00:00",
-  "body": "# Deploying the API\n\n...",
   "markdown": "---\nid: \"kp-2e85...\"\ntype: \"runbook\"\n...\n---\n\n# Deploying the API\n\n..."
 }
 ```
 
-- `body` is the synthesized markdown body on its own.
-- `markdown` is the full document: a YAML frontmatter block (`id`, `type`, `title`, `description`, `tags`, `timestamp`) followed by the body.
+- `markdown` is the full document: a YAML frontmatter block (`id`, `type`, `title`, `description`, `tags`, `timestamp`) followed by the synthesized markdown body.
 - `type` comes from a `type:<x>` tag and defaults to `knowledge-page`. The `type:` tag is removed from the returned `tags`.
 
 ---

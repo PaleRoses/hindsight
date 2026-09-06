@@ -1631,7 +1631,7 @@ class Hindsight:
             page_id: The page ID
 
         Returns:
-            KnowledgePageResponse with body and full markdown (frontmatter + body)
+            KnowledgePageResponse whose markdown is the full document (frontmatter + body)
         """
         return _run_async(
             self._knowledge_base_api.get_knowledge_page(bank_id, page_id, _request_timeout=self._timeout)

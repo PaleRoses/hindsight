@@ -73,6 +73,35 @@ function flatten(nodes: KnowledgeNode[], out: KnowledgeNode[] = []): KnowledgeNo
   return out;
 }
 
+// A page arrives as one canonical document: a YAML frontmatter block, then the
+// synthesized markdown body. The header below already renders every frontmatter
+// field from its own response field, so the reading pane wants the body alone.
+const FRONTMATTER_FENCE = "---";
+
+/**
+ * The body of a page document — everything after the closing fence of a
+ * *leading, complete* frontmatter block, plus the single blank line the
+ * renderer writes as their separator.
+ *
+ * Deliberately narrow: no leading fence, or no closing fence, means the whole
+ * string is markdown in its own right and is returned untouched. Only the first
+ * blank line after the fence is dropped, so a body that opens on a thematic
+ * break (`---`) keeps it, and nothing rewrites the body's own indentation.
+ */
+function pageBody(markdown: string): string {
+  const lines = markdown.split("\n");
+  if (lines[0] !== FRONTMATTER_FENCE) return markdown;
+  // Frontmatter values are always quoted scalars or `  - ` list items, so the
+  // first bare fence after the opener is the closing one.
+  const close = lines.indexOf(FRONTMATTER_FENCE, 1);
+  if (close < 0) return markdown;
+  const body = lines.slice(close + 1);
+  if (body[0] === "") body.shift();
+  // Trailing-only trim: an empty body must read as empty (the pane shows its
+  // own note), while a first line's indentation is part of the markdown.
+  return body.join("\n").trimEnd();
+}
+
 export function KnowledgeBaseView() {
   const t = useTranslations("knowledgeBase");
   const { currentBank } = useBank();
@@ -108,6 +137,9 @@ export function KnowledgeBaseView() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const selected = useMemo(() => tabs.find((tb) => tb.id === activeId) ?? null, [tabs, activeId]);
+  // What the reading pane shows: the open document minus its frontmatter block,
+  // which the header above renders field by field.
+  const selectedBody = useMemo(() => (selected ? pageBody(selected.markdown) : ""), [selected]);
   // Provenance: how many source memories grounded the open page's last synthesis.
   // Derived from the backing mental model's reflect_response (not the page endpoint).
   const [supportingCount, setSupportingCount] = useState(0);
@@ -660,9 +692,9 @@ export function KnowledgeBaseView() {
                 </details>
               )}
 
-              {selected.body ? (
+              {selectedBody ? (
                 <div className="prose prose-sm dark:prose-invert max-w-none border-t border-border mt-5 pt-5">
-                  <CompactMarkdown>{selected.body}</CompactMarkdown>
+                  <CompactMarkdown>{selectedBody}</CompactMarkdown>
                 </div>
               ) : (
                 <p className="text-sm text-muted-foreground italic border-t border-border mt-5 pt-5">

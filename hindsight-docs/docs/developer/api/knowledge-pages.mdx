@@ -259,13 +259,11 @@ Returns the page rendered as a markdown document.
   "description": "How is the API deployed?",
   "tags": ["ops"],
   "timestamp": "2026-08-03T09:12:44+00:00",
-  "body": "# Deploying the API\n\n...",
   "markdown": "---\nid: \"kp-2e85...\"\ntype: \"runbook\"\n...\n---\n\n# Deploying the API\n\n..."
 }
 ```
 
-- `body` is the synthesized markdown body on its own.
-- `markdown` is the full document: a YAML frontmatter block (`id`, `type`, `title`, `description`, `tags`, `timestamp`) followed by the body.
+- `markdown` is the full document: a YAML frontmatter block (`id`, `type`, `title`, `description`, `tags`, `timestamp`) followed by the synthesized markdown body.
 - `type` comes from a `type:<x>` tag and defaults to `knowledge-page`. The `type:` tag is removed from the returned `tags`.
 
 ---

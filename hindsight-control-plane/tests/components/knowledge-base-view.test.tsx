@@ -1,9 +1,12 @@
 // @vitest-environment jsdom
 /**
- * Regression tests for #3807: the Knowledge view must never request a page or a
- * mental model id under a bank that doesn't own it — neither while switching
- * banks (the previous bank's tree is still on screen) nor from a `?page=` deep
- * link aimed at another bank.
+ * Regression tests for the Knowledge view:
+ *
+ *  - #3807: it must never request a page or a mental model id under a bank that
+ *    doesn't own it — neither while switching banks (the previous bank's tree is
+ *    still on screen) nor from a `?page=` deep link aimed at another bank.
+ *  - The reading pane must show the body of the one canonical document the page
+ *    endpoint returns, rather than its frontmatter block or nothing at all.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
@@ -39,10 +42,13 @@ vi.mock("@/lib/api", () => ({
   },
 }));
 
-// The page body renderer pulls in the markdown stack, which this test doesn't
-// exercise; the modal is only mounted from a click.
+// The real renderer pulls in the markdown stack, which these tests don't
+// exercise; what they check is the markdown the pane hands it. The modal is only
+// mounted from a click.
 vi.mock("@/components/compact-markdown", () => ({
-  CompactMarkdown: ({ children }: { children?: string }) => <div>{children}</div>,
+  CompactMarkdown: ({ children }: { children?: string }) => (
+    <div data-testid="page-body">{children}</div>
+  ),
 }));
 vi.mock("@/components/mental-model-detail-modal", () => ({
   MentalModelDetailModal: () => null,
@@ -67,6 +73,24 @@ function pageNode(bank: string, suffix: string, name: string): KnowledgeNode {
   };
 }
 
+/**
+ * A page as the API returns it: one canonical markdown document — a YAML
+ * frontmatter block, then the synthesized body, with a blank line between them.
+ * There is no separate `body` field; this document is the only copy.
+ */
+function pageDocument(id: string, body: string): string {
+  const frontmatter = ["---", `id: "${id}"`, 'type: "knowledge-page"', `title: "${id}"`, "---"].join(
+    "\n"
+  );
+  return body ? `${frontmatter}\n\n${body}\n` : `${frontmatter}\n`;
+}
+
+// The body every page fixture carries, unless a test replaces it before
+// rendering. Indented so a pane that reformats the body instead of passing it
+// through shows up in the assertion.
+const DEFAULT_PAGE_BODY = "## Ops\n\n- parent\n  - child";
+let pageBody = DEFAULT_PAGE_BODY;
+
 const TREES: Record<string, KnowledgeNode[]> = {
   "bank-a": [pageNode("bank-a", "1", "A first"), pageNode("bank-a", "2", "A second")],
   "bank-b": [pageNode("bank-b", "1", "B first")],
@@ -89,6 +113,7 @@ function crossBankRequests(): string[] {
 
 beforeEach(() => {
   currentBank = "bank-a";
+  pageBody = DEFAULT_PAGE_BODY;
   searchParams.delete("page");
   getKnowledgeTree.mockReset();
   getKnowledgePage.mockReset();
@@ -103,8 +128,7 @@ beforeEach(() => {
       description: null,
       tags: [],
       timestamp: null,
-      body: "body",
-      markdown: "markdown",
+      markdown: pageDocument(id, pageBody),
     };
   });
   getMentalModel.mockImplementation(async (bank: string, id: string) => {
@@ -160,5 +184,32 @@ describe("KnowledgeBaseView bank scoping", () => {
 
     await waitFor(() => expect(getKnowledgePage).toHaveBeenCalledWith("bank-a", "kp-bank-a-2"));
     expect(getKnowledgePage).not.toHaveBeenCalledWith("bank-a", "kp-bank-a-1");
+  });
+});
+
+describe("KnowledgeBaseView reading pane", () => {
+  it("shows the document body, without the frontmatter block", async () => {
+    render(<KnowledgeBaseView />);
+
+    const pane = await screen.findByTestId("page-body");
+    expect(pane.textContent).toBe(DEFAULT_PAGE_BODY);
+  });
+
+  it("keeps a body that opens on a thematic break", async () => {
+    pageBody = "---\n\nAfter the break.";
+
+    render(<KnowledgeBaseView />);
+
+    const pane = await screen.findByTestId("page-body");
+    expect(pane.textContent).toBe("---\n\nAfter the break.");
+  });
+
+  it("reads a document with no body as an empty page", async () => {
+    pageBody = "";
+
+    render(<KnowledgeBaseView />);
+
+    await waitFor(() => expect(screen.getAllByText("noBody").length).toBe(1));
+    expect(screen.queryByTestId("page-body")).toBe(null);
   });
 });

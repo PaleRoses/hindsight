@@ -445,22 +445,27 @@ export class HindsightClient {
    *
    *  The list endpoint pages — default 20, hard max 100, newest first — over a table that reaches
    *  five figures on a busy bank, so filtering one page counts "non-terminal among the newest 20"
-   *  and silently saturates at 20. Ask the server for a per-status `total` instead: one `limit=1`
-   *  probe per non-terminal status, which is exact at any backlog depth and cheaper than a page.
+   *  and silently saturates at 20. Let the server count instead: `active_only=true` narrows the
+   *  endpoint's own `total` to the non-terminal rows, so one `limit=1` probe is exact at any
+   *  backlog depth and cheaper than a page.
+   *
+   *  ONE request, and not one per non-terminal status: two counts are taken at two different
+   *  instants, so an operation that moves `pending` → `processing` between them is missed by both
+   *  (the `processing` count runs while it is still pending, the `pending` count after it has
+   *  moved) and the pair sums to zero while the bank is still working. A single count cannot
+   *  straddle that transition.
+   *
+   *  A server too old to know the flag ignores it and returns the whole table's total — an
+   *  OVERCOUNT, which reads as "still busy"; it can never fake a drained bank, and the caller's
+   *  settle loop stops on a count that is no longer falling.
    *
    *  A pending op deferred far into the future (a deliberately held retry backlog) counts as active
    *  here — the endpoint exposes no next_retry_at filter, so "active" means "not yet terminal". */
   async activeOperations(): Promise<number> {
-    const NON_TERMINAL = ["pending", "processing"];
     try {
-      const totals = await Promise.all(
-        NON_TERMINAL.map(async (status) => {
-          const r = await this.req("GET", this.bankUrl(`/operations?status=${status}&limit=1`));
-          const j = (await r.json()) as { total?: number };
-          return typeof j.total === "number" ? j.total : 0;
-        })
-      );
-      return totals.reduce((a, b) => a + b, 0);
+      const r = await this.req("GET", this.bankUrl("/operations?active_only=true&limit=1"));
+      const j = (await r.json()) as { total?: number };
+      return typeof j.total === "number" ? j.total : 0;
     } catch {
       return 0;
     }

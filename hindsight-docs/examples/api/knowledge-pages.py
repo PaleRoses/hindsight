@@ -66,8 +66,7 @@ for root in tree.roots:
 document = client.get_knowledge_page(BANK_ID, page.page_id)
 
 print(document.type)      # "runbook" — from the type:runbook tag
-print(document.body)      # the synthesized markdown body
-print(document.markdown)  # YAML frontmatter + body
+print(document.markdown)  # YAML frontmatter + synthesized markdown body
 # [/docs:get-page]
 
 # [docs:search-pages]

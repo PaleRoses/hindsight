@@ -19041,6 +19041,7 @@ class MemoryEngine(MemoryEngineInterface):
         limit: int = 20,
         offset: int = 0,
         exclude_parents: bool = False,
+        active_only: bool = False,
         request_context: "RequestContext",
     ) -> dict[str, Any]:
         """List async operations for a bank with optional filtering and pagination.
@@ -19052,6 +19053,10 @@ class MemoryEngine(MemoryEngineInterface):
             limit: Maximum number of operations to return (default 20)
             offset: Number of operations to skip (default 0)
             exclude_parents: If True, exclude parent batch operations (is_parent=True in result_metadata)
+            active_only: If True, return only operations that have not reached a terminal state
+                (status pending or processing). Applies to the returned `total` as well, so a
+                caller can read an exact backlog depth from one `limit=1` request instead of
+                summing a request per non-terminal status.
             request_context: Request context for authentication
 
         Returns:
@@ -19082,6 +19087,9 @@ class MemoryEngine(MemoryEngineInterface):
 
             if exclude_parents:
                 where_conditions.append("NOT (result_metadata::jsonb @> '{\"is_parent\": true}'::jsonb)")
+
+            if active_only:
+                where_conditions.append("status IN ('pending', 'processing')")
 
             where_clause = " AND ".join(where_conditions)
 

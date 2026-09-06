@@ -2745,6 +2745,21 @@ paths:
           title: Exclude Parents
           type: boolean
         style: form
+      - description: "Return only operations that are not yet terminal (status pending\
+          \ or processing). The reported total counts the same filtered set, so one\
+          \ limit=1 request yields the exact active backlog."
+        explode: true
+        in: query
+        name: active_only
+        required: false
+        schema:
+          default: false
+          description: "Return only operations that are not yet terminal (status pending\
+            \ or processing). The reported total counts the same filtered set, so\
+            \ one limit=1 request yields the exact active backlog."
+          title: Active Only
+          type: boolean
+        style: form
       - explode: false
         in: header
         name: authorization
@@ -7307,8 +7322,8 @@ components:
         markdown: markdown
         description: description
         id: id
+        is_stale: true
         type: type
-        body: body
         tags:
         - tags
         - tags
@@ -7335,13 +7350,13 @@ components:
         timestamp:
           nullable: true
           type: string
-        body:
-          nullable: true
-          type: string
         markdown:
           description: "The full markdown document: YAML frontmatter + markdown body."
           title: Markdown
           type: string
+        is_stale:
+          nullable: true
+          type: boolean
       required:
       - id
       - markdown

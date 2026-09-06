@@ -207,6 +207,30 @@ pub fn create_page(
     }
 }
 
+/// The page body: everything after the closing fence of a *leading, complete*
+/// frontmatter block, minus the single blank line the renderer writes as their
+/// separator and any trailing whitespace.
+///
+/// A page arrives as one document — frontmatter, then the synthesized body —
+/// and the pretty view prints every frontmatter field from its own response
+/// field, so reprinting the block would duplicate the header. A document with
+/// no leading block is markdown in its own right and is returned whole, and a
+/// body that opens on a thematic break (`---`) keeps it.
+fn document_body(markdown: &str) -> &str {
+    let Some(after_open) = markdown.strip_prefix("---\n") else {
+        return markdown.trim_end();
+    };
+    let mut offset = 0;
+    for line in after_open.split_inclusive('\n') {
+        offset += line.len();
+        if line.trim_end_matches(['\r', '\n']) == "---" {
+            let body = &after_open[offset..];
+            return body.strip_prefix('\n').unwrap_or(body).trim_end();
+        }
+    }
+    markdown.trim_end()
+}
+
 /// Read a page as a markdown document
 pub fn get_page(
     client: &ApiClient,
@@ -242,7 +266,8 @@ pub fn get_page(
                 if !page.tags.is_empty() {
                     println!("  {} {}", ui::dim("Tags:"), page.tags.join(", "));
                 }
-                if let Some(ref body) = page.body {
+                let body = document_body(&page.markdown);
+                if !body.is_empty() {
                     println!();
                     println!("{}", body);
                     println!();
@@ -539,5 +564,36 @@ mod tests {
             err.contains("invalid --mode 'incremental'"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn document_body_drops_a_leading_frontmatter_block() {
+        let doc = "---\nid: kp-1\ntype: runbook\n---\n\n# Deploy\n\nStep one.\n";
+        assert_eq!(document_body(doc), "# Deploy\n\nStep one.");
+    }
+
+    #[test]
+    fn document_body_keeps_a_body_opening_on_a_thematic_break() {
+        let doc = "---\nid: kp-1\n---\n\n---\n\n# Deploy\n";
+        assert_eq!(document_body(doc), "---\n\n# Deploy");
+    }
+
+    #[test]
+    fn document_body_is_empty_for_a_page_with_no_content() {
+        assert_eq!(document_body("---\nid: kp-1\n---\n"), "");
+    }
+
+    #[test]
+    fn document_body_returns_plain_markdown_untouched() {
+        assert_eq!(
+            document_body("# Deploy\n\nStep one.\n"),
+            "# Deploy\n\nStep one."
+        );
+    }
+
+    #[test]
+    fn document_body_returns_the_whole_document_when_the_fence_never_closes() {
+        let doc = "---\nid: kp-1\ntype: runbook\n";
+        assert_eq!(document_body(doc), doc.trim_end());
     }
 }

@@ -84,9 +84,8 @@ func main() {
 	// Read a page as a markdown document
 	document, _, _ := client.KnowledgeBaseAPI.GetKnowledgePage(ctx, kpBankID, page.PageId).Execute()
 
-	fmt.Println(document.Type)      // "runbook" — from the type:runbook tag
-	fmt.Println(document.GetBody()) // the synthesized markdown body
-	fmt.Println(document.Markdown)  // YAML frontmatter + body
+	fmt.Println(document.Type)     // "runbook" — from the type:runbook tag
+	fmt.Println(document.Markdown) // YAML frontmatter + synthesized markdown body
 	// [/docs:get-page]
 
 	// [docs:search-pages]

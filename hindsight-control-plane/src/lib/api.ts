@@ -814,7 +814,11 @@ export class ControlPlaneClient {
   }
 
   /**
-   * Get a single knowledge page rendered as a markdown document.
+   * Get a single knowledge page as one canonical markdown document.
+   *
+   * `markdown` is the whole document — a YAML frontmatter block followed by the
+   * synthesized body — and is the only place the body is returned; it is not
+   * shipped a second time under a field of its own.
    */
   async getKnowledgePage(bankId: string, pageId: string) {
     return this.fetchApi<{
@@ -824,7 +828,6 @@ export class ControlPlaneClient {
       description: string | null;
       tags: string[];
       timestamp: string | null;
-      body: string | null;
       markdown: string;
     }>(
       `/api/knowledge-base/pages/${encodeURIComponent(pageId)}?bank_id=${encodeURIComponent(bankId)}`

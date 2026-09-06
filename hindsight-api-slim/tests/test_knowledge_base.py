@@ -750,9 +750,10 @@ class TestGetPage:
         assert page["markdown"].startswith("---\n")
         assert 'type: "runbook"' in page["markdown"]
         # The body rides inside the rendered document, and ONLY there: a page runs to tens of KB,
-        # so returning it under `body` as well doubled the cost of every read.
+        # so returning it under `body` as well doubled the cost of every read. The response schema
+        # declares no such field, so the key must be absent rather than present-and-null.
         assert "\n# Orders" in page["markdown"]
-        assert page.get("body") is None
+        assert "body" not in page
 
     async def test_reports_staleness_and_agrees_with_the_tree(self, api_client, kb_bank):
         """The reader of a page is who can act on the page being behind.

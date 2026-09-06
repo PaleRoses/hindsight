@@ -62,8 +62,7 @@ for (const root of tree.roots) {
 const document = await client.getKnowledgePage(BANK_ID, page.page_id);
 
 console.log(document.type);      // "runbook" — from the type:runbook tag
-console.log(document.body);      // the synthesized markdown body
-console.log(document.markdown);  // YAML frontmatter + body
+console.log(document.markdown);  // YAML frontmatter + synthesized markdown body
 // [/docs:get-page]
 
 // [docs:search-pages]

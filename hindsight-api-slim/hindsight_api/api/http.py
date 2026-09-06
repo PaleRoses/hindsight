@@ -2919,7 +2919,6 @@ class KnowledgePageResponse(BaseModel):
     description: str | None = Field(default=None, description="The source query that rebuilds the page.")
     tags: list[str] = FieldWithDefault(list)
     timestamp: str | None = Field(default=None, description="Last refresh time (falls back to creation).")
-    body: str | None = Field(default=None, description="The page's synthesized markdown body.")
     markdown: str = Field(description="The full markdown document: YAML frontmatter + markdown body.")
     is_stale: bool | None = Field(
         default=None,
@@ -2997,8 +2996,8 @@ def _build_knowledge_tree(nodes: list[dict[str, Any]]) -> list[KnowledgeNode]:
 def _knowledge_page_response(node: dict[str, Any]) -> KnowledgePageResponse:
     """Project a page node (with merged mental-model content) into a markdown document."""
     page = page_markdown.page_type(node.get("tags"))
-    # The rendered document already carries the body under a frontmatter block, so it is returned
-    # once rather than alongside a duplicate `body` field — the same cut the MCP surface took in
+    # The response carries the document exactly once: the rendered markdown holds the body under a
+    # frontmatter block, so there is no separate `body` field — the same cut the MCP surface took in
     # `mcp_tools._do_get_knowledge_page`. A page runs to tens of KB; shipping it twice doubled every
     # read and pushed the largest pages past the token ceiling of the agents that consume them.
     return KnowledgePageResponse(
@@ -7109,6 +7108,14 @@ def _register_routes(app: FastAPI):
         limit: int = Query(default=20, ge=1, le=100, description="Maximum number of operations to return"),
         offset: int = Query(default=0, ge=0, description="Number of operations to skip"),
         exclude_parents: bool = Query(default=False, description="Exclude parent batch operations from results"),
+        active_only: bool = Query(
+            default=False,
+            description=(
+                "Return only operations that are not yet terminal (status pending or processing). "
+                "The reported total counts the same filtered set, so one limit=1 request yields the "
+                "exact active backlog."
+            ),
+        ),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """List async operations for a memory bank with optional filtering and pagination."""
@@ -7120,6 +7127,7 @@ def _register_routes(app: FastAPI):
                 limit=limit,
                 offset=offset,
                 exclude_parents=exclude_parents,
+                active_only=active_only,
                 request_context=request_context,
             )
             return OperationsListResponse(

@@ -2502,17 +2502,17 @@ export type KnowledgePageResponse = {
    */
   timestamp?: string | null;
   /**
-   * Body
-   *
-   * The page's synthesized markdown body.
-   */
-  body?: string | null;
-  /**
    * Markdown
    *
    * The full markdown document: YAML frontmatter + markdown body.
    */
   markdown: string;
+  /**
+   * Is Stale
+   *
+   * True when a memory in this page's scope has been written since the page last read the memories — the same check that decides whether a scheduled refresh would rewrite it, so a flagged page is one the server already knows is behind its own corpus. The tree endpoint has always reported this; the page read now reports it too, because the reader of a page is who needs it. Null when the page has no backing mental model.
+   */
+  is_stale?: boolean | null;
 };
 
 /**
@@ -7925,6 +7925,12 @@ export type ListOperationsData = {
      * Exclude parent batch operations from results
      */
     exclude_parents?: boolean;
+    /**
+     * Active Only
+     *
+     * Return only operations that are not yet terminal (status pending or processing). The reported total counts the same filtered set, so one limit=1 request yields the exact active backlog.
+     */
+    active_only?: boolean;
   };
   url: "/v1/default/banks/{bank_id}/operations";
 };

@@ -3931,11 +3931,12 @@ def _register_delete_document(mcp: FastMCP, memory: MemoryEngine, config: MCPToo
 def _register_list_operations(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
     """Register the list_operations tool."""
 
-    async def _run(target_bank: str, status: str | None, limit: int) -> Any:
+    async def _run(target_bank: str, status: str | None, limit: int, active_only: bool) -> Any:
         result = await memory.list_operations(
             target_bank,
             status=status,
             limit=limit,
+            active_only=active_only,
             request_context=_get_request_context(config),
         )
         return result
@@ -3946,6 +3947,7 @@ def _register_list_operations(mcp: FastMCP, memory: MemoryEngine, config: MCPToo
         async def list_operations(
             status: str | None = None,
             limit: int = 20,
+            active_only: bool = False,
             bank_id: str | None = None,
         ) -> str:
             """
@@ -3956,6 +3958,9 @@ def _register_list_operations(mcp: FastMCP, memory: MemoryEngine, config: MCPToo
             Args:
                 status: Filter by status: 'pending', 'running', 'completed', 'failed', 'cancelled'
                 limit: Maximum number of results (default: 20)
+                active_only: Only operations that are still pending or processing. The response
+                    'total' counts the same set, so it reports the whole active backlog even when
+                    'limit' returns fewer rows.
                 bank_id: Optional bank (defaults to session bank). Use for cross-bank operations.
             """
             return await _run_tool(
@@ -3963,7 +3968,7 @@ def _register_list_operations(mcp: FastMCP, memory: MemoryEngine, config: MCPToo
                 bank_id=bank_id,
                 as_json=True,
                 action="listing operations",
-                run=lambda target_bank: _run(target_bank, status, limit),
+                run=lambda target_bank: _run(target_bank, status, limit, active_only),
             )
 
     else:
@@ -3972,6 +3977,7 @@ def _register_list_operations(mcp: FastMCP, memory: MemoryEngine, config: MCPToo
         async def list_operations(
             status: str | None = None,
             limit: int = 20,
+            active_only: bool = False,
         ) -> dict:
             """
             List async operations for this memory bank.
@@ -3981,13 +3987,16 @@ def _register_list_operations(mcp: FastMCP, memory: MemoryEngine, config: MCPToo
             Args:
                 status: Filter by status: 'pending', 'running', 'completed', 'failed', 'cancelled'
                 limit: Maximum number of results (default: 20)
+                active_only: Only operations that are still pending or processing. The response
+                    'total' counts the same set, so it reports the whole active backlog even when
+                    'limit' returns fewer rows.
             """
             return await _run_tool(
                 config,
                 bank_id=None,
                 as_json=False,
                 action="listing operations",
-                run=lambda target_bank: _run(target_bank, status, limit),
+                run=lambda target_bank: _run(target_bank, status, limit, active_only),
             )
 
 

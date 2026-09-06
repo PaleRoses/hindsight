@@ -1153,6 +1153,64 @@ async def test_list_operations_exclude_parents(memory, request_context):
 
 
 @pytest.mark.asyncio
+async def test_list_operations_active_only_conjoins_with_exclude_parents(memory, request_context):
+    """active_only and exclude_parents both narrow the one WHERE clause the count is taken over."""
+    bank_id = "test_active_only_exclude_parents"
+    pool = await memory._get_pool()
+    await _ensure_bank(pool, bank_id)
+
+    active_parent_id = uuid.uuid4()
+    active_child_id = uuid.uuid4()
+    done_child_id = uuid.uuid4()
+    active_standalone_id = uuid.uuid4()
+
+    async with pool.acquire() as conn:
+        for op_id, op_type, metadata, status in (
+            (active_parent_id, "batch_retain", {"items_count": 2, "is_parent": True}, "pending"),
+            (active_child_id, "retain", {"parent_operation_id": str(active_parent_id)}, "processing"),
+            (done_child_id, "retain", {"parent_operation_id": str(active_parent_id)}, "completed"),
+            (active_standalone_id, "consolidation", {}, "pending"),
+        ):
+            await conn.execute(
+                """
+                INSERT INTO async_operations (operation_id, bank_id, operation_type, result_metadata, status)
+                VALUES ($1, $2, $3, $4, $5)
+                """,
+                op_id,
+                bank_id,
+                op_type,
+                json.dumps(metadata),
+                status,
+            )
+
+    active = await memory.list_operations(
+        bank_id=bank_id,
+        request_context=request_context,
+        limit=10,
+        active_only=True,
+    )
+    assert {op["id"] for op in active["operations"]} == {
+        str(active_parent_id),
+        str(active_child_id),
+        str(active_standalone_id),
+    }
+    assert active["total"] == 3
+
+    active_leaves = await memory.list_operations(
+        bank_id=bank_id,
+        request_context=request_context,
+        limit=10,
+        exclude_parents=True,
+        active_only=True,
+    )
+    assert {op["id"] for op in active_leaves["operations"]} == {
+        str(active_child_id),
+        str(active_standalone_id),
+    }
+    assert active_leaves["total"] == 2
+
+
+@pytest.mark.asyncio
 async def test_request_context_retry_count_propagated_to_validator(memory_no_llm_verify, request_context):
     """_handle_batch_retain forwards the task's _retry_count as
     RequestContext.retry_count, so validator extensions can compute
