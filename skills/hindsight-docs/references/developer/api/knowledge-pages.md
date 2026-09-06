@@ -341,12 +341,14 @@ hindsight knowledge-base get-page "$BANK_ID" "$PAGE_ID"
   "tags": ["ops"],
   "timestamp": "2026-08-03T09:12:44+00:00",
   "body": "# Deploying the API\n\n...",
-  "markdown": "---\nid: \"kp-2e85...\"\ntype: \"runbook\"\n...\n---\n\n# Deploying the API\n\n..."
+  "markdown": "---\nid: \"kp-2e85...\"\ntype: \"runbook\"\n...\n---\n\n# Deploying the API\n\n...",
+  "is_stale": true
 }
 ```
 
 - `body` is the synthesized markdown body on its own.
 - `markdown` is the full document: a YAML frontmatter block (`id`, `type`, `title`, `description`, `tags`, `timestamp`) followed by the body.
+- `is_stale` is the same verdict the tree reports for this page, resolved against the same scope: `true` when a memory in the page's scope has been written since the page last read the memories, so a refresh would rewrite it. `null` when the page has no backing mental model. Read a flagged page for orientation and verify specific claims against the source.
 - `type` comes from a `type:<x>` tag and defaults to `knowledge-page`. The `type:` tag is removed from the returned `tags`.
 
 ---

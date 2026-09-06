@@ -3951,6 +3951,18 @@
             "description": "Exclude parent batch operations from results"
           },
           {
+            "name": "active_only",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Return only operations that are not yet terminal (status pending or processing). The reported total counts the same filtered set, so one limit=1 request yields the exact active backlog.",
+              "default": false,
+              "title": "Active Only"
+            },
+            "description": "Return only operations that are not yet terminal (status pending or processing). The reported total counts the same filtered set, so one limit=1 request yields the exact active backlog."
+          },
+          {
             "name": "authorization",
             "in": "header",
             "required": false,
@@ -11012,6 +11024,18 @@
             "type": "string",
             "title": "Markdown",
             "description": "The full markdown document: YAML frontmatter + markdown body."
+          },
+          "is_stale": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Stale",
+            "description": "True when a memory in this page's scope has been written since the page last read the memories \u2014 the same check that decides whether a scheduled refresh would rewrite it, so a flagged page is one the server already knows is behind its own corpus. The tree endpoint has always reported this; the page read now reports it too, because the reader of a page is who needs it. Null when the page has no backing mental model."
           }
         },
         "type": "object",

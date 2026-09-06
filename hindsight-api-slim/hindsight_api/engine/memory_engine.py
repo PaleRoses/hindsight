@@ -17791,7 +17791,11 @@ class MemoryEngine(MemoryEngineInterface):
     async def get_knowledge_page(
         self, bank_id: str, page_id: str, *, request_context: "RequestContext"
     ) -> dict[str, Any] | None:
-        """Return a page node merged with its mental model's content (for markdown rendering)."""
+        """Return a page node merged with its mental model's content (for markdown rendering).
+
+        The node also carries ``is_stale`` — the same verdict the tree reports per page, absent
+        when the page has no backing mental model.
+        """
         await self._authenticate_tenant(request_context)
         if self._operation_validator and not _nested_operation_authorized.get():
             from hindsight_api.extensions import BankReadContext, BankReadOperation
@@ -17813,8 +17817,27 @@ class MemoryEngine(MemoryEngineInterface):
                 bank_id,
                 page_id,
             )
-        if row is None:
-            return None
+            if row is None:
+                return None
+            # The SELECT above already returns every column the scope resolver wants, so this
+            # costs one scoped existence check on a connection already held. Single-model check
+            # rather than the tree's batch one: it also asks whether the document cites facts
+            # since removed, which the batch variant skips to stay at one round-trip.
+            is_stale = (
+                await self.compute_mental_model_is_stale(
+                    conn,
+                    bank_id,
+                    {
+                        "id": row["mental_model_id"],
+                        "tags": row["mm_tags"],
+                        "trigger": row["mm_trigger"],
+                        "last_memory_seen_at": row["mm_last_memory_seen_at"],
+                        "last_refreshed_at": row["mm_last_refreshed_at"],
+                    },
+                )
+                if row["mental_model_id"] is not None
+                else None
+            )
 
         # A page read IS a mental model read: the join above returns
         # ``mm.content`` as the page body, so this delivers exactly what
@@ -17826,8 +17849,8 @@ class MemoryEngine(MemoryEngineInterface):
         # model's id is a property of the page rather than something the
         # caller supplies — it is not known until the row is read. The gate
         # still runs before any content is returned, so a rejected read
-        # yields no page; the only cost of the reordering is one indexed
-        # SELECT performed for a request that is then refused.
+        # yields no page; the only cost of the reordering is the indexed SELECT and the
+        # staleness check above, performed for a request that is then refused.
         mental_model_id = row["mental_model_id"]
         meter = bool(mental_model_id) and not _nested_operation_authorized.get()
         if meter:
@@ -17835,6 +17858,8 @@ class MemoryEngine(MemoryEngineInterface):
 
         node = self._row_to_knowledge_node(row)
         node["content"] = row["mm_content"]
+        if mental_model_id is not None:
+            node["is_stale"] = is_stale
 
         if meter:
             await self._record_mental_model_read(
@@ -19020,6 +19045,7 @@ class MemoryEngine(MemoryEngineInterface):
         limit: int = 20,
         offset: int = 0,
         exclude_parents: bool = False,
+        active_only: bool = False,
         request_context: "RequestContext",
     ) -> dict[str, Any]:
         """List async operations for a bank with optional filtering and pagination.
@@ -19031,6 +19057,9 @@ class MemoryEngine(MemoryEngineInterface):
             limit: Maximum number of operations to return (default 20)
             offset: Number of operations to skip (default 0)
             exclude_parents: If True, exclude parent batch operations (is_parent=True in result_metadata)
+            active_only: If True, return only operations that are not yet terminal (status pending
+                or processing). Narrows the returned `total` too, so one `limit=1` request reports
+                the exact backlog depth.
             request_context: Request context for authentication
 
         Returns:
@@ -19061,6 +19090,9 @@ class MemoryEngine(MemoryEngineInterface):
 
             if exclude_parents:
                 where_conditions.append("NOT (result_metadata::jsonb @> '{\"is_parent\": true}'::jsonb)")
+
+            if active_only:
+                where_conditions.append("status IN ('pending', 'processing')")
 
             where_clause = " AND ".join(where_conditions)
 

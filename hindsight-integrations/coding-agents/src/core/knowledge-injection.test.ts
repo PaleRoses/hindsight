@@ -15,6 +15,20 @@ describe("parsePageList", () => {
       { id: "p2", title: "Core concepts" },
     ]);
   });
+  it("carries the server's staleness verdict, and only when it gave one", () => {
+    const items = [
+      { id: "p1", name: "Component map", is_stale: true },
+      { id: "p2", name: "Core concepts", is_stale: false },
+      { id: "p3", name: "Key decisions" },
+      { id: "p4", name: "Conventions", is_stale: "yes" },
+    ];
+    expect(parsePageList({ items })).toEqual([
+      { id: "p1", title: "Component map", stale: true },
+      { id: "p2", title: "Core concepts", stale: false },
+      { id: "p3", title: "Key decisions" },
+      { id: "p4", title: "Conventions" },
+    ]);
+  });
   it("returns [] for null/garbage", () => {
     expect(parsePageList(null)).toEqual([]);
     expect(parsePageList(42 as unknown)).toEqual([]);
@@ -91,5 +105,30 @@ describe("buildRosterRefresh", () => {
     expect(out).toContain("hindsight_ingest_document");
     // No roster block when there are no pages.
     expect(out).not.toContain("Current Hindsight knowledge pages");
+  });
+});
+
+describe("staleness in the injected rosters", () => {
+  const PAGES = [
+    { id: "p1", title: "Component map", stale: true },
+    { id: "p2", title: "Core concepts", stale: false },
+  ];
+
+  it("marks a stale page in the SessionStart roster and explains the mark once", () => {
+    const out = buildKnowledgePreamble(PAGES);
+    expect(out).toContain("- Component map (p1) — STALE");
+    expect(out).toContain("- Core concepts (p2)");
+    expect(out).not.toContain("- Core concepts (p2) — STALE");
+    expect(out.match(/Pages marked STALE/g)).toHaveLength(1);
+  });
+
+  /** The roster re-appears on every refresh, so the mark must survive there — and a legend
+   *  printed unconditionally is boilerplate, which stops being read. */
+  it("marks it in the periodic refresh too, and drops the legend when nothing is flagged", () => {
+    expect(buildRosterRefresh(PAGES)).toContain("- Component map (p1) — STALE");
+    for (const out of [buildKnowledgePreamble([PAGES[1]]), buildRosterRefresh([PAGES[1]])]) {
+      expect(out).not.toContain("STALE");
+      expect(out).toContain("- Core concepts (p2)");
+    }
   });
 });

@@ -2921,6 +2921,12 @@ class KnowledgePageResponse(BaseModel):
     timestamp: str | None = Field(default=None, description="Last refresh time (falls back to creation).")
     body: str | None = Field(default=None, description="The page's synthesized markdown body.")
     markdown: str = Field(description="The full markdown document: YAML frontmatter + markdown body.")
+    is_stale: bool | None = Field(
+        default=None,
+        description="True when a memory in this page's scope has been written since the page last "
+        "read the memories — the same check the refresh gate asks, and the one the tree endpoint "
+        "already reports. Null when the page has no backing mental model.",
+    )
 
 
 class KnowledgePageBundleFile(BaseModel):
@@ -2998,6 +3004,7 @@ def _knowledge_page_response(node: dict[str, Any]) -> KnowledgePageResponse:
         timestamp=node.get("last_refreshed_at") or node.get("created_at"),
         body=node.get("content"),
         markdown=page_markdown.render_document(node),
+        is_stale=node.get("is_stale"),
     )
 
 
@@ -7090,6 +7097,14 @@ def _register_routes(app: FastAPI):
         limit: int = Query(default=20, ge=1, le=100, description="Maximum number of operations to return"),
         offset: int = Query(default=0, ge=0, description="Number of operations to skip"),
         exclude_parents: bool = Query(default=False, description="Exclude parent batch operations from results"),
+        active_only: bool = Query(
+            default=False,
+            description=(
+                "Return only operations that are not yet terminal (status pending or processing). "
+                "The reported total counts the same filtered set, so one limit=1 request yields the "
+                "exact active backlog."
+            ),
+        ),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """List async operations for a memory bank with optional filtering and pagination."""
@@ -7101,6 +7116,7 @@ def _register_routes(app: FastAPI):
                 limit=limit,
                 offset=offset,
                 exclude_parents=exclude_parents,
+                active_only=active_only,
                 request_context=request_context,
             )
             return OperationsListResponse(

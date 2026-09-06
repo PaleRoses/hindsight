@@ -403,6 +403,27 @@ class TestTree:
             assert page["is_stale"] == model["is_stale"], page["name"]
 
     @pytest.mark.memory_backend_incompatible
+    async def test_a_page_read_reports_its_own_staleness(self, api_client, memory, kb_bank):
+        """A page read answers its own staleness, agreeing with the tree in both states.
+
+        A reader who cannot tell a current document from a known-stale one trusts both equally.
+        """
+        bank_id, ids = kb_bank
+        page_url = f"/v1/default/banks/{_enc(bank_id)}/knowledge-base/pages/{ids.orders}"
+        tree_url = f"/v1/default/banks/{_enc(bank_id)}/knowledge-base/tree"
+
+        async def _verdicts() -> tuple[bool, bool]:
+            page = (await api_client.get(page_url)).json()
+            roots = {r["name"]: r for r in (await api_client.get(tree_url)).json()["roots"]}
+            orders = next(c for c in roots["Runbooks"]["children"] if c["name"] == "Orders")
+            return page["is_stale"], orders["is_stale"]
+
+        assert await _verdicts() == (False, False)
+        # Every one of Orders' tags, so the write lands in its scope (all_strict is a superset test).
+        await self._insert_memory(memory, bank_id, ["type:runbook", "sales", "revenue"])
+        assert await _verdicts() == (True, True)
+
+    @pytest.mark.memory_backend_incompatible
     async def test_tree_asks_once_for_the_whole_tree(self, api_client, memory, kb_bank):
         """Per-page answers, but not a query per page — the tree view polls."""
         bank_id, ids = kb_bank

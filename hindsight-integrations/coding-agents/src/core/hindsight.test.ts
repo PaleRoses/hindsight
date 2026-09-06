@@ -518,3 +518,32 @@ describe("every client-building entrypoint forwards observationScopes", () => {
     expect(dropped).toEqual([]);
   });
 });
+
+describe("HindsightClient.activeOperations", () => {
+  /** The fixture is the adversary: `active_only` applies the server's own predicate, `status`
+   *  filters, `total` counts the FILTERED set while only `limit` rows come back, and the 374
+   *  in-flight ops sit in whichever non-terminal status a single-status caller did NOT ask about.
+   *  So a page count reads 1, an unfiltered total 1000, and the per-status pair it replaced 0. */
+  it("reads the whole non-terminal backlog from one server-side count", async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      const q = new URL(url).searchParams;
+      const asked = q.get("status");
+      const flight = asked === "pending" ? "processing" : "pending";
+      const rows = Array.from({ length: 1000 }, (_, i) => (i < 374 ? flight : "completed"))
+        .filter((s) => q.get("active_only") !== "true" || s === "pending" || s === "processing")
+        .filter((s) => !asked || s === asked);
+      return jsonResponse(200, {
+        total: rows.length,
+        operations: rows.slice(0, Number(q.get("limit") ?? 20)).map((status) => ({ status })),
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new HindsightClient({ apiUrl: "http://x", bank: "b" });
+    expect(await client.activeOperations()).toBe(374);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const q = new URL(String(fetchMock.mock.calls[0][0])).searchParams;
+    expect(q.get("active_only")).toBe("true");
+    expect(q.get("limit")).toBe("1");
+  });
+});

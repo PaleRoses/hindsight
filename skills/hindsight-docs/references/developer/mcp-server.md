@@ -564,6 +564,7 @@ List async operations (retain processing, mental model refresh, etc.) with optio
 |-----------|------|----------|-------------|
 | `status` | string | No | Filter by status: `pending`, `running`, `completed`, `failed`, `cancelled` |
 | `limit` | integer | No | Maximum number of results (default: 100) |
+| `active_only` | boolean | No | Only operations that have not reached a terminal state (`pending` or `processing`). The reported `total` counts the same set, so it reports the whole active backlog even when `limit` returns fewer rows |
 
 ---
 
@@ -677,7 +678,7 @@ Find knowledge pages by relevance (hybrid BM25 + vector search over page names a
 
 ### get_knowledge_page
 
-Read a knowledge page as a markdown document (YAML frontmatter + synthesized body).
+Read a knowledge page as a markdown document (YAML frontmatter + synthesized body). The result also reports `is_stale`, the same verdict the tree gives for that page: `true` means memories in the page's scope have been written since it last refreshed, so verify specific claims against the source.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

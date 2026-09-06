@@ -17,7 +17,7 @@ import pprint
 import re  # noqa: F401
 import json
 
-from pydantic import BaseModel, ConfigDict, Field, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr
 from typing import Any, ClassVar, Dict, List, Optional
 from typing import Optional, Set
 from typing_extensions import Self
@@ -34,7 +34,8 @@ class KnowledgePageResponse(BaseModel):
     timestamp: Optional[StrictStr] = None
     body: Optional[StrictStr] = None
     markdown: StrictStr = Field(description="The full markdown document: YAML frontmatter + markdown body.")
-    __properties: ClassVar[List[str]] = ["id", "name", "type", "description", "tags", "timestamp", "body", "markdown"]
+    is_stale: Optional[StrictBool] = None
+    __properties: ClassVar[List[str]] = ["id", "name", "type", "description", "tags", "timestamp", "body", "markdown", "is_stale"]
 
     model_config = ConfigDict(
         populate_by_name=True,
@@ -90,6 +91,11 @@ class KnowledgePageResponse(BaseModel):
         if self.body is None and "body" in self.model_fields_set:
             _dict['body'] = None
 
+        # set to None if is_stale (nullable) is None
+        # and model_fields_set contains the field
+        if self.is_stale is None and "is_stale" in self.model_fields_set:
+            _dict['is_stale'] = None
+
         return _dict
 
     @classmethod
@@ -109,7 +115,8 @@ class KnowledgePageResponse(BaseModel):
             "tags": obj.get("tags"),
             "timestamp": obj.get("timestamp"),
             "body": obj.get("body"),
-            "markdown": obj.get("markdown")
+            "markdown": obj.get("markdown"),
+            "is_stale": obj.get("is_stale")
         })
         return _obj
 
