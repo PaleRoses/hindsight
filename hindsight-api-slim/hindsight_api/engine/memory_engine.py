@@ -17791,7 +17791,14 @@ class MemoryEngine(MemoryEngineInterface):
     async def get_knowledge_page(
         self, bank_id: str, page_id: str, *, request_context: "RequestContext"
     ) -> dict[str, Any] | None:
-        """Return a page node merged with its mental model's content (for markdown rendering)."""
+        """Return a page node merged with its mental model's content (for markdown rendering).
+
+        The node also carries ``is_stale`` — whether a memory in this page's scope has been
+        written since the page last read the memories, the same question the refresh gate asks.
+        The tree reports it for every page; a caller that reads one page got no answer at all
+        until it did, which left the page's only consumer unable to tell a current document
+        from one the server already knows is behind.
+        """
         await self._authenticate_tenant(request_context)
         if self._operation_validator and not _nested_operation_authorized.get():
             from hindsight_api.extensions import BankReadContext, BankReadOperation
@@ -17813,8 +17820,28 @@ class MemoryEngine(MemoryEngineInterface):
                 bank_id,
                 page_id,
             )
-        if row is None:
-            return None
+            if row is None:
+                return None
+            node = self._row_to_knowledge_node(row)
+            node["content"] = row["mm_content"]
+            # Whoever is reading the page is exactly who needs to know it is behind its own
+            # corpus, and the join above already selects every column the scope resolver wants,
+            # so the answer costs one scoped existence check on a connection already held.
+            # The single-model check rather than the tree's batch one: it additionally asks
+            # whether the document still cites facts that have since been removed, which the
+            # batch variant skips only to keep the polling surfaces to a single round-trip.
+            if row["mental_model_id"] is not None:
+                node["is_stale"] = await self.compute_mental_model_is_stale(
+                    conn,
+                    bank_id,
+                    {
+                        "id": row["mental_model_id"],
+                        "tags": row["mm_tags"],
+                        "trigger": row["mm_trigger"],
+                        "last_memory_seen_at": row["mm_last_memory_seen_at"],
+                        "last_refreshed_at": row["mm_last_refreshed_at"],
+                    },
+                )
 
         # A page read IS a mental model read: the join above returns
         # ``mm.content`` as the page body, so this delivers exactly what
@@ -17826,17 +17853,11 @@ class MemoryEngine(MemoryEngineInterface):
         # model's id is a property of the page rather than something the
         # caller supplies — it is not known until the row is read. The gate
         # still runs before any content is returned, so a rejected read
-        # yields no page; the only cost of the reordering is one indexed
-        # SELECT performed for a request that is then refused.
+        # yields no page; the lookup and staleness check precede that gate.
         mental_model_id = row["mental_model_id"]
         meter = bool(mental_model_id) and not _nested_operation_authorized.get()
         if meter:
             await self._gate_mental_model_read(bank_id, mental_model_id, request_context=request_context)
-
-        node = self._row_to_knowledge_node(row)
-        node["content"] = row["mm_content"]
-
-        if meter:
             await self._record_mental_model_read(
                 bank_id, mental_model_id, node.get("content"), request_context=request_context
             )

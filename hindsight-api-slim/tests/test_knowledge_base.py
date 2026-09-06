@@ -747,9 +747,49 @@ class TestGetPage:
         assert resp.status_code == 200, resp.text
         page = resp.json()
         assert page["type"] == "runbook"
-        assert page["body"].startswith("# Orders")
         assert page["markdown"].startswith("---\n")
         assert 'type: "runbook"' in page["markdown"]
+        # The body rides inside the rendered document, and ONLY there: a page runs to tens of KB,
+        # so returning it under `body` as well doubled the cost of every read.
+        assert "\n# Orders" in page["markdown"]
+        assert page.get("body") is None
+
+    async def test_reports_staleness_and_agrees_with_the_tree(self, api_client, kb_bank):
+        """The reader of a page is who can act on the page being behind.
+
+        The tree has always answered this per page; the single-page read answered nothing, so an
+        agent that read a document had no way to tell a current one from one the server already
+        knew was stale. Both surfaces resolve the same scope, so they must not disagree.
+        """
+        bank_id, ids = kb_bank
+        page = (await api_client.get(f"/v1/default/banks/{_enc(bank_id)}/knowledge-base/pages/{ids.orders}")).json()
+        # Seeded with content and no memories written since: nothing in scope is newer.
+        assert page["is_stale"] is False
+
+        tree = (await api_client.get(f"/v1/default/banks/{_enc(bank_id)}/knowledge-base/tree")).json()
+        by_id = {}
+
+        def walk(nodes):
+            for n in nodes:
+                by_id[n["id"]] = n
+                walk(n.get("children") or [])
+
+        walk(tree["roots"])
+        assert by_id[ids.orders]["is_stale"] == page["is_stale"]
+
+    async def test_stale_page_is_reported_as_stale(self, api_client, memory, kb_bank, monkeypatch):
+        """The projection passes the engine's verdict through rather than flattening it."""
+        bank_id, ids = kb_bank
+        original = memory.get_knowledge_page
+
+        async def stale_node(**kwargs):
+            node = await original(**kwargs)
+            node["is_stale"] = True
+            return node
+
+        monkeypatch.setattr(memory, "get_knowledge_page", stale_node)
+        resp = await api_client.get(f"/v1/default/banks/{_enc(bank_id)}/knowledge-base/pages/{ids.orders}")
+        assert resp.json()["is_stale"] is True
 
     async def test_missing_page_404(self, api_client, kb_bank):
         bank_id, ids = kb_bank
@@ -1465,13 +1505,15 @@ class TestPageReadIsAModelRead:
         monkeypatch.setattr(memory, "_operation_validator", validator)
 
         resp = await api_client.get(f"/v1/default/banks/{_enc(bank_id)}/knowledge-base/pages/{ids.orders}")
-        body = resp.json()
+        model_resp = await api_client.get(f"/v1/default/banks/{_enc(bank_id)}/mental-models/{ids.orders_mm}")
 
-        # The response renames the model's content to body; the hook is
-        # given the same string, so the recorded size must track it.
-        assert len(validator.model_get_tokens) == 1
-        assert validator.model_get_tokens[0] == len(body.get("body") or "") // 4
-        assert validator.model_get_tokens[0] > 0
+        assert resp.status_code == 200, resp.text
+        assert model_resp.status_code == 200, model_resp.text
+        assert model_resp.json()["content"] in resp.json()["markdown"]
+        # The same content must be metered identically through either read surface,
+        # even when the page carries its body only inside the rendered markdown.
+        page_tokens, model_tokens = validator.model_get_tokens
+        assert page_tokens == model_tokens > 0
 
     async def test_a_refused_model_get_returns_no_page_content(self, api_client, kb_bank, memory, monkeypatch):
         # The gate has to run before the body is handed back, or it is

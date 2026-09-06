@@ -26,6 +26,10 @@ export interface KnowledgeNode {
   /** The page's EFFECTIVE refresh policy, on servers new enough to report it (#3572). Absent
    *  everywhere else, which `seedPages()` reads as "unknown, leave it alone". */
   trigger?: { tags_match?: string };
+  /** Pages only: a memory in this page's scope has been written since the page last read the
+   *  memories, so the server already knows the document is behind its own corpus. Absent on
+   *  folders, and on servers that predate the flag. */
+  is_stale?: boolean | null;
   children?: KnowledgeNode[];
 }
 
@@ -437,17 +441,26 @@ export class HindsightClient {
     await this.req("DELETE", this.bankUrl(`/documents/${encodeURIComponent(documentId)}`));
   }
 
-  /** Count of operations still ACTIVE on this bank — the list includes terminal ops (completed/
-   *  failed/cancelled), so filter by status. Powers syncStatus's "extractions drained" check. */
+  /** Count of operations still ACTIVE on this bank. Powers syncStatus's "extractions drained" check.
+   *
+   *  The list endpoint pages — default 20, hard max 100, newest first — over a table that reaches
+   *  five figures on a busy bank, so filtering one page counts "non-terminal among the newest 20"
+   *  and silently saturates at 20. Ask the server for a per-status `total` instead: one `limit=1`
+   *  probe per non-terminal status, which is exact at any backlog depth and cheaper than a page.
+   *
+   *  A pending op deferred far into the future (a deliberately held retry backlog) counts as active
+   *  here — the endpoint exposes no next_retry_at filter, so "active" means "not yet terminal". */
   async activeOperations(): Promise<number> {
-    const r = await this.req("GET", this.bankUrl("/operations"));
+    const NON_TERMINAL = ["pending", "processing"];
     try {
-      const j = (await r.json()) as {
-        operations?: { status?: string }[];
-        items?: { status?: string }[];
-      };
-      const ops = j.operations ?? j.items ?? [];
-      return ops.filter((o) => !TERMINAL.has((o?.status || "").toLowerCase())).length;
+      const totals = await Promise.all(
+        NON_TERMINAL.map(async (status) => {
+          const r = await this.req("GET", this.bankUrl(`/operations?status=${status}&limit=1`));
+          const j = (await r.json()) as { total?: number };
+          return typeof j.total === "number" ? j.total : 0;
+        })
+      );
+      return totals.reduce((a, b) => a + b, 0);
     } catch {
       return 0;
     }
@@ -555,7 +568,13 @@ export class HindsightClient {
    * here, from `searchKnowledgePages`, or from a `[[page:<id>]]` link all resolve identically.
    */
   async listPages(): Promise<unknown> {
-    const items: { id: string; name: string; description?: string; folder?: string }[] = [];
+    const items: {
+      id: string;
+      name: string;
+      description?: string;
+      folder?: string;
+      is_stale?: boolean;
+    }[] = [];
     const walk = (nodes: KnowledgeNode[], folder?: string): void => {
       for (const n of nodes) {
         if (!n?.id || !n?.name) continue;
@@ -565,6 +584,11 @@ export class HindsightClient {
             name: n.name,
             ...(n.description ? { description: n.description } : {}),
             ...(folder ? { folder } : {}),
+            // Carried, not dropped: the roster this feeds is the only place most agents ever
+            // learn a page exists, so it is also the only place they can be told it is behind.
+            // Omitted rather than defaulted when the server does not report it — absent means
+            // "unknown", which must not render as "current".
+            ...(typeof n.is_stale === "boolean" ? { is_stale: n.is_stale } : {}),
           });
         }
         if (n.children?.length) walk(n.children, n.kind === "folder" ? n.name : folder);

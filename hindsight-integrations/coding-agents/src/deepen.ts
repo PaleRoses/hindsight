@@ -37,6 +37,7 @@ import { getHarness, HARNESS_NAMES } from "./harness/registry";
 import { diag } from "./core/diag";
 import { buildRetainStamp } from "./core/retain-stamp";
 import { describeError, log as plog, setLogLevel } from "./core/log";
+import { settleForProgress } from "./core/settle";
 
 const DIFF_BATCH = 50; // per-run cap on per-commit diff ingestion (bounded session cost)
 const LOCK_STALE_MS = 30 * 60 * 1000;
@@ -285,19 +286,12 @@ async function main() {
     await client.drain(client.opIds, "extraction");
 
     // The drain above only covers operations THIS run enqueued — consolidation and the template's
-    // page refreshes run server-side on their own schedule. `synced` requires ZERO active ops, so
-    // wait (bounded) for the bank to fully settle before declaring the run complete.
-    const settleDeadline = Date.now() + 15 * 60 * 1000;
-    for (;;) {
-      const active = await client.activeOperations().catch(() => 0);
-      if (active === 0) break;
-      if (Date.now() > settleDeadline) {
-        log(`[deepen] ${active} server-side op(s) still active at settle timeout — proceeding`);
-        break;
-      }
-      log(`[deepen] waiting for ${active} server-side op(s) to settle …`);
-      await new Promise((r) => setTimeout(r, 5000));
-    }
+    // page refreshes run server-side on their own schedule, so give them a moment to land. This
+    // waits for PROGRESS, never for a bank-wide zero: see core/settle.ts for why zero is the wrong
+    // target, and why waiting for it here locks the next session out of ingesting anything.
+    await settleForProgress(() => client.activeOperations().catch(() => 0), {
+      log: (m) => log(`[deepen] ${m}`),
+    });
     // (knowledge pages need no separate pass: configureBank seeds them through the knowledge-base
     // API every run, matched by name — syncStatus's `synced` stays sound because it also requires
     // the gitlog seed present AND zero active extraction operations.)

@@ -2921,6 +2921,14 @@ class KnowledgePageResponse(BaseModel):
     timestamp: str | None = Field(default=None, description="Last refresh time (falls back to creation).")
     body: str | None = Field(default=None, description="The page's synthesized markdown body.")
     markdown: str = Field(description="The full markdown document: YAML frontmatter + markdown body.")
+    is_stale: bool | None = Field(
+        default=None,
+        description="True when a memory in this page's scope has been written since the page last "
+        "read the memories — the same check that decides whether a scheduled refresh would rewrite "
+        "it, so a flagged page is one the server already knows is behind its own corpus. The tree "
+        "endpoint has always reported this; the page read now reports it too, because the reader of "
+        "a page is who needs it. Null when the page has no backing mental model.",
+    )
 
 
 class KnowledgePageBundleFile(BaseModel):
@@ -2989,6 +2997,10 @@ def _build_knowledge_tree(nodes: list[dict[str, Any]]) -> list[KnowledgeNode]:
 def _knowledge_page_response(node: dict[str, Any]) -> KnowledgePageResponse:
     """Project a page node (with merged mental-model content) into a markdown document."""
     page = page_markdown.page_type(node.get("tags"))
+    # The rendered document already carries the body under a frontmatter block, so it is returned
+    # once rather than alongside a duplicate `body` field — the same cut the MCP surface took in
+    # `mcp_tools._do_get_knowledge_page`. A page runs to tens of KB; shipping it twice doubled every
+    # read and pushed the largest pages past the token ceiling of the agents that consume them.
     return KnowledgePageResponse(
         id=node["id"],
         name=node["name"],
@@ -2996,8 +3008,8 @@ def _knowledge_page_response(node: dict[str, Any]) -> KnowledgePageResponse:
         description=node.get("source_query"),
         tags=page.display_tags,
         timestamp=node.get("last_refreshed_at") or node.get("created_at"),
-        body=node.get("content"),
         markdown=page_markdown.render_document(node),
+        is_stale=node.get("is_stale"),
     )
 
 

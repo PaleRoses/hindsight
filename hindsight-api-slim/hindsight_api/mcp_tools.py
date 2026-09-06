@@ -2456,6 +2456,10 @@ async def _do_get_knowledge_page(
         "tags": page.display_tags,
         "timestamp": node.get("last_refreshed_at") or node.get("created_at"),
         "markdown": page_markdown.render_document(node),
+        # Whether the server already knows this document is behind its own corpus. The reader
+        # is the one who can act on that — by verifying a claim against the source instead of
+        # trusting it — so it travels with the document rather than only with the tree.
+        "is_stale": node.get("is_stale"),
     }
 
 

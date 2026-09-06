@@ -518,3 +518,57 @@ describe("every client-building entrypoint forwards observationScopes", () => {
     expect(dropped).toEqual([]);
   });
 });
+
+describe("HindsightClient.activeOperations", () => {
+  /** The list endpoint pages (default 20, max 100) over a table that reaches five figures, so a
+   *  count taken from one page saturates at the page size. These fixtures return a page far
+   *  smaller than the true total: counting rows passes 2, counting `total` passes 374. */
+  const PAGE_OF_TWENTY = Array.from({ length: 20 }, (_, i) => ({
+    status: i < 2 ? "pending" : "completed",
+  }));
+
+  it("sums per-status totals instead of counting one page of rows", async () => {
+    const seen: string[] = [];
+    const fetchMock = vi.fn(async (url: string) => {
+      seen.push(url);
+      const status = new URL(url).searchParams.get("status");
+      const total = status === "pending" ? 372 : status === "processing" ? 2 : 0;
+      return jsonResponse(200, { total, operations: PAGE_OF_TWENTY.slice(0, 1) });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new HindsightClient({ apiUrl: "http://x", bank: "b" });
+    expect(await client.activeOperations()).toBe(374);
+
+    // Every request must narrow by status; an unfiltered GET is the defect being fixed.
+    expect(seen).toHaveLength(2);
+    for (const url of seen) expect(new URL(url).searchParams.get("status")).toBeTruthy();
+    expect(seen.map((u) => new URL(u).searchParams.get("status")).sort()).toEqual([
+      "pending",
+      "processing",
+    ]);
+  });
+
+  it("does not count terminal operations", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        const status = new URL(url).searchParams.get("status");
+        // A bank whose only rows are terminal: 10652 completed, 889 failed, 2 cancelled.
+        const total = status === "pending" || status === "processing" ? 0 : 11543;
+        return jsonResponse(200, { total, operations: PAGE_OF_TWENTY });
+      })
+    );
+    const client = new HindsightClient({ apiUrl: "http://x", bank: "b" });
+    expect(await client.activeOperations()).toBe(0);
+  });
+
+  it("degrades to 0 when the endpoint fails", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse(500, { detail: "boom" }))
+    );
+    const client = new HindsightClient({ apiUrl: "http://x", bank: "b" });
+    expect(await client.activeOperations()).toBe(0);
+  });
+});

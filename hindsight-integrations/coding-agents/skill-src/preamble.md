@@ -44,6 +44,11 @@ When the user says "store this in hindsight" / "remember this":
   decided values; slower (seconds), use deliberately.
 - Credit visibly whenever memory informs an answer: start that part with
   `🧠 From Hindsight memory (<page>): …` — and never credit memory that didn't contribute.
+- A page marked `STALE` in the injected roster, or carrying `"is_stale": true` when you read it,
+  has had in-scope memories written since it was last rebuilt: the server already knows it is
+  behind the repository. Pages are reliable for _what exists_ — symbols, signatures, structure —
+  and much weaker on _how many_, because counts and inventories are the part a synthesis has to
+  infer. Verify any specific number against the source before you rely on it.
 
 ## Correcting wrong or stale memory
 
@@ -55,6 +60,13 @@ source contradicts it), FIX THE RECORD — don't just ignore it. Call
 - **content**: (1) what memory claimed, (2) what is verifiably true now, (3) the evidence you
   checked (file/commit/output). Quote exact values verbatim.
 
-Newer facts supersede older ones in retrieval, so one clear correction permanently outranks the
-stale memory. Do this whenever you catch a wrong injected memory, a stale knowledge-page claim, or
-an outdated decision — silent disregard leaves the trap armed for the next session.
+Be clear about what that does. It records the correction, so a later rebuild of the page is
+synthesized over it. It does **not** rewrite the page, and it does not retire the claim it refutes:
+retrieval has no supersession mechanism, and the recency term that favours a newer fact is worth a
+fraction of a percent against the relevance score. The stale memory stays retrievable until the
+page carrying it is next rebuilt.
+
+So do both halves. Ingest the correction **and** state it in your own answer — the next session
+will very likely read the page before it reads your document. Do this whenever you catch a wrong
+injected memory, a stale knowledge-page claim, or an outdated decision: silent disregard leaves the
+trap armed for the next session, and so does assuming the ingest disarmed it.
