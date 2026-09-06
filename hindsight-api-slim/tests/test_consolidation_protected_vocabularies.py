@@ -18,8 +18,8 @@ from hindsight_api.engine.consolidation.consolidator import (
     _consolidate_batch_with_protected_vocabularies,
     _CreateAction,
     _dedup_adjudicate,
-    _dedup_reconcile_create,
-    _dedup_reconcile_update,
+    _apply_dedup_create_fold,
+    _apply_dedup_update_fold,
     _DedupDecision,
     _find_protected_vocabulary_violations,
     _protected_vocabulary_conflicts,
@@ -27,7 +27,7 @@ from hindsight_api.engine.consolidation.consolidator import (
     _TemporalBounds,
     _UpdateAction,
 )
-from hindsight_api.engine.response_models import MemoryFact
+from hindsight_api.engine.response_models import LLMCallResult, MemoryFact, TokenUsage
 from hindsight_api.engine.search.retrieval import SemanticBm25Result
 from hindsight_api.engine.search.types import RetrievalResult
 
@@ -207,7 +207,7 @@ async def test_guard_real_worker_keeps_vocabulary_retries_at_the_outer_boundary(
         if attempts == 1:
             raise RuntimeError("transient provider failure")
         response_format = kwargs["response_format"]
-        return response_format(creates=[], updates=[], deletes=[])
+        return LLMCallResult(content=response_format(creates=[], updates=[], deletes=[]), usage=TokenUsage())
 
     llm = types.SimpleNamespace(call=AsyncMock(side_effect=call))
     perf = ConsolidationPerfLog("bank")
@@ -322,7 +322,8 @@ async def test_dedup_can_select_compatible_candidate_after_rejected_twin() -> No
         fact_type="observation",
         similarity=0.98,
     )
-    llm = types.SimpleNamespace(call=AsyncMock(return_value=_DedupDecision(action="keep")))
+    decision = LLMCallResult(content=_DedupDecision(action="keep"), usage=TokenUsage())
+    llm = types.SimpleNamespace(call=AsyncMock(return_value=decision))
 
     with (
         patch(
@@ -481,7 +482,8 @@ async def test_dedup_rejects_protected_term_drift_in_merged_text() -> None:
         fact_type="observation",
         similarity=0.99,
     )
-    llm = types.SimpleNamespace(call=AsyncMock(return_value=_DedupDecision(action="merge", text=_ENVIRONMENT_TARGET)))
+    decision = LLMCallResult(content=_DedupDecision(action="merge", text=_ENVIRONMENT_TARGET), usage=TokenUsage())
+    llm = types.SimpleNamespace(call=AsyncMock(return_value=decision))
 
     with (
         patch(
@@ -523,6 +525,8 @@ async def test_incompatible_create_reconciliation_performs_no_write() -> None:
         similarity=0.999,
     )
     conn = AsyncMock()
+    memory_engine = types.SimpleNamespace(embeddings=object())
+    config = types.SimpleNamespace(consolidation_dedup_threshold=0.97)
     llm = types.SimpleNamespace(call=AsyncMock())
 
     with (
@@ -537,21 +541,34 @@ async def test_incompatible_create_reconciliation_performs_no_write() -> None:
             AsyncMock(return_value=[[0.1, 0.2]]),
         ),
     ):
-        merged_into = await _dedup_reconcile_create(
+        # Adjudication is connection-free and the fold runs on the batch's connection inside the
+        # batch's transaction, so the guard is checked across both halves: an incompatible twin
+        # must be refused while preparing and must reach no write while applying.
+        outcome = await _dedup_adjudicate(
             pool=conn,
-            memory_engine=types.SimpleNamespace(embeddings=object()),
+            memory_engine=memory_engine,
             bank_id="bank",
-            config=types.SimpleNamespace(consolidation_dedup_threshold=0.97),
+            config=config,
             dedup_llm_config=llm,
-            create_text="A source-root split was completed.",
-            create_source_ids=[uuid.UUID(_ENVIRONMENT_SOURCE_ID)],
+            anchor_text="A source-root split was completed.",
+            anchor_emb_str=None,
             tags=[],
-            source_bounds=_TemporalBounds(),
+            exclude_id=None,
             protected_vocabularies=_vocabularies(),
-            source_protected_texts=(_ENVIRONMENT_SOURCE,),
+            protected_evidence=(_ENVIRONMENT_SOURCE,),
+        )
+        merged_into = await _apply_dedup_create_fold(
+            conn,
+            memory_engine,
+            "bank",
+            config,
+            outcome,
+            [uuid.UUID(_ENVIRONMENT_SOURCE_ID)],
+            _TemporalBounds(),
         )
 
     assert merged_into is None
+    conn.fetchval.assert_not_called()
     conn.execute.assert_not_called()
     llm.call.assert_not_called()
 
@@ -563,7 +580,11 @@ async def test_incompatible_update_reconciliation_performs_no_write() -> None:
         fact_type="observation",
         similarity=0.999,
     )
+    updated_id = "11111111-1111-4111-8111-111111111111"
+    updated_text = "A source-root split was completed."
     conn = AsyncMock()
+    memory_engine = types.SimpleNamespace(embeddings=object())
+    config = types.SimpleNamespace(consolidation_dedup_threshold=0.97)
     llm = types.SimpleNamespace(call=AsyncMock())
 
     with patch(
@@ -572,20 +593,24 @@ async def test_incompatible_update_reconciliation_performs_no_write() -> None:
             recall_unified=AsyncMock(return_value={"observation": SemanticBm25Result([candidate], [], None)})
         ),
     ):
-        await _dedup_reconcile_update(
+        outcome = await _dedup_adjudicate(
             pool=conn,
-            memory_engine=types.SimpleNamespace(embeddings=object()),
+            memory_engine=memory_engine,
             bank_id="bank",
-            config=types.SimpleNamespace(consolidation_dedup_threshold=0.97),
+            config=config,
             dedup_llm_config=llm,
-            updated_id="11111111-1111-4111-8111-111111111111",
-            updated_text="A source-root split was completed.",
-            updated_emb_str="[0.1, 0.2]",
+            anchor_text=updated_text,
+            anchor_emb_str="[0.1, 0.2]",
             tags=[],
+            exclude_id=updated_id,
             protected_vocabularies=_vocabularies(),
             protected_evidence=(_ENVIRONMENT_SOURCE,),
         )
+        folded = await _apply_dedup_update_fold(conn, memory_engine, "bank", config, outcome, updated_id, updated_text)
 
+    assert folded is False
+    conn.fetchrow.assert_not_called()
+    conn.fetchval.assert_not_called()
     conn.execute.assert_not_called()
     llm.call.assert_not_called()
 
