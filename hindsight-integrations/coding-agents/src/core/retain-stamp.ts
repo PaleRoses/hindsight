@@ -26,7 +26,7 @@ import { projectNameOf } from "./bank";
 import { basename } from "node:path";
 
 /** Tag namespaces the plugin owns — see the filter in buildRetainStamp. */
-const RESERVED_TAG_PREFIX = /^(source|harness):/;
+const RESERVED_TAG_PREFIX = /^(source|harness|principal):/;
 
 export interface RetainStampContext {
   /** Working directory the retain is being written from — the repo, for {project}/{gitProject}. */
@@ -46,6 +46,7 @@ export interface RetainStamp {
 }
 
 export interface RetainStampConfig {
+  principal?: string;
   retainTags?: string[];
   retainMetadata?: Record<string, string>;
 }
@@ -72,7 +73,10 @@ function resolversFor(ctx: RetainStampContext): Resolvers {
 export function buildRetainStamp(cfg: RetainStampConfig, ctx: RetainStampContext): RetainStamp {
   const hasTags = Boolean(cfg.retainTags?.length);
   const hasMetadata = Boolean(cfg.retainMetadata && Object.keys(cfg.retainMetadata).length);
-  if (!hasTags && !hasMetadata) return { tags: [], metadata: {} };
+  if (!hasTags && !hasMetadata)
+    return cfg.principal
+      ? { tags: [`principal:${cfg.principal}`], metadata: { principal: cfg.principal } }
+      : { tags: [], metadata: {} };
 
   // Built lazily and memoized: {gitProject} shells out to git, and a config using it in both a tag
   // and a metadata value should not pay for that twice per retain.
@@ -106,6 +110,12 @@ export function buildRetainStamp(cfg: RetainStampConfig, ctx: RetainStampContext
   const metadata: Record<string, string> = {};
   for (const [key, value] of Object.entries(cfg.retainMetadata ?? {})) {
     metadata[key] = applyTemplate(value, resolvers, "retainMetadata");
+  }
+  if (cfg.principal) {
+    tags.push(`principal:${cfg.principal}`);
+    metadata.principal = cfg.principal;
+  } else {
+    delete metadata.principal;
   }
   return { tags, metadata };
 }

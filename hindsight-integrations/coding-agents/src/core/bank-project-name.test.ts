@@ -88,6 +88,27 @@ describe("bankProjectName", () => {
       expect(bankProjectName({ bankIdTemplate: "{project}" }, "/work/one-repo")).toBeUndefined();
       expect(bankProjectName({ bankIdTemplate: "{user}-{channel}" }, "/work/x")).toBeUndefined();
     });
+
+    it("declines for a principal's bank, keeping its page text identical across repos", () => {
+      // An owner's bank collects every repository that identity works in, so the page scope is the
+      // BANK. Naming the repo of whichever session ran last is the #4146 rewrite loop.
+      const BANK = "Alpha::Personal Memory";
+      const cfg = {
+        principals: { ok: true as const, entries: { alpha: { bankId: BANK } } },
+        principal: "alpha",
+      };
+
+      mockProbe.mockReturnValue(inRepo("/work/one-repo/.git"));
+      expect(deriveBankId(cfg, "/work/one-repo")).toBe(BANK);
+      expect(bankProjectName(cfg, "/work/one-repo")).toBeUndefined();
+      const fromRepoA = pagesFor(bankProjectName(cfg, "/work/one-repo") ?? BANK);
+
+      mockProbe.mockReturnValue(inRepo("/elsewhere/two-repo/.git"));
+      const fromRepoB = pagesFor(bankProjectName(cfg, "/elsewhere/two-repo") ?? BANK);
+
+      expect(fromRepoB).toEqual(fromRepoA);
+      for (const page of fromRepoA) expect(page.source_query).toContain(BANK);
+    });
   });
 
   it("returns undefined rather than throwing when the probe cannot name the repository", () => {

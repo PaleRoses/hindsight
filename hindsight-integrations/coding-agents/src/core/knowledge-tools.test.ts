@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -145,6 +145,46 @@ describe("buildKnowledgeTools", () => {
     });
     // Booleans only — the value itself must never leave the process.
     expect(JSON.stringify(report)).not.toContain("credential-the-host-started-with");
+  });
+
+  it("diagnoses a changed owner or bank without relabeling the live host", async () => {
+    const root = mkdtempSync(join(tmpdir(), "hs-owner-diagnose-"));
+    const path = join(root, "config.json");
+    const configure = (principal: string, alphaBank = "private-a") =>
+      writeFileSync(
+        path,
+        JSON.stringify({
+          principal,
+          principals: { alpha: { bankId: alphaBank }, beta: { bankId: "private-b" } },
+        })
+      );
+    vi.stubEnv("HINDSIGHT_CONFIG", path);
+    vi.resetModules();
+    try {
+      configure("alpha");
+      const { buildKnowledgeTools: build } = await import("./knowledge-tools");
+      const tool = findTool(
+        build(stubClient(), "private-a", { principal: "alpha" }),
+        "hindsight_diagnose"
+      );
+      const report = async () => JSON.parse((await tool.handler({})).content[0].text);
+      expect((await report()).config.principal_matches_binding).toBe(true);
+      configure("alpha", "moved-a");
+      expect(await report()).toMatchObject({
+        principal: "alpha",
+        bank_id: "private-a",
+        config: { principal: "alpha", principal_matches_binding: false },
+      });
+      configure("beta");
+      expect(await report()).toMatchObject({
+        principal: "alpha",
+        bank_id: "private-a",
+        config: { principal: "beta", principal_matches_binding: false },
+      });
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("hindsight_search_knowledge_pages calls the server hybrid search and returns ranked hits", async () => {

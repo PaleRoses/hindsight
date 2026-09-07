@@ -30,9 +30,20 @@ const CONFIG_PATH =
 export const DEFAULT_DAEMON_PORT = 9077;
 export const DEFAULT_DAEMON_PROFILE = "coding-agent";
 
-/** Incremental git-sync settings (see core/sync.ts). */
+/** A stable memory owner, independent of the client or model acting for it. */
+export interface PrincipalConfig {
+  readonly bankId: string;
+}
+
+export type PrincipalRegistryResult =
+  | { readonly ok: true; readonly entries: Readonly<Record<string, PrincipalConfig>> }
+  | { readonly ok: false; readonly reason: string };
+
 /** The config file's shape — every field optional; omitted fields take the documented default. */
 export interface RawConfig {
+  /** Stable memory owners; file-only, never replaced by a harness or bank override. */
+  principals?: Record<string, PrincipalConfig>;
+  principal?: string;
   /** Where memory lives. All three modes speak the same HTTP API; they differ only in who runs it:
    *   "cloud"       — Hindsight Cloud (the default `apiUrl`)
    *   "self-hosted" — a Hindsight server you run; set `apiUrl` to it
@@ -165,7 +176,7 @@ export interface RawConfig {
   observationScopes?: ObservationScopes;
   /** Per-harness overrides of any of the fields above, keyed by harness name ("opencode",
    *  "claude-code", ...). Lets one config file give each agent its own bank/settings. */
-  harnesses?: Record<string, Omit<RawConfig, "harnesses">>;
+  harnesses?: Record<string, Omit<RawConfig, "harnesses" | "principals">>;
   /** Per-BANK overrides, applied AFTER bank resolution — the per-repo opt-in/out surface, keyed
    *  by the RESOLVED bank id (run a session once or check the banner to see it). Any behavioral
    *  field, plus `bank` to RENAME the destination (single hop: the section is selected by the
@@ -174,11 +185,16 @@ export interface RawConfig {
    *    "banks": { "coding-agent::secret-client": { "disabled": true },
    *               "coding-agent::old-name": { "bank": "team::shared" },
    *               "coding-agent::big-mono": { "gitIngest": "full", "retainSessions": false } } */
-  banks?: Record<string, Omit<RawConfig, "banks" | "harnesses"> & { bank?: string }>;
+  banks?: Record<
+    string,
+    Omit<RawConfig, "banks" | "harnesses" | "principals" | "principal"> & { bank?: string }
+  >;
 }
 
 /** Fully-resolved config: every field present. */
 export interface Config {
+  principals: PrincipalRegistryResult;
+  principal?: string;
   serverMode: "cloud" | "self-hosted" | "daemon";
   /** The EFFECTIVE base URL. In daemon mode this is already 127.0.0.1:{apiPort}, so every caller
    *  that builds a client keeps working without knowing which mode is active. */
@@ -219,7 +235,7 @@ export interface Config {
   retainMetadata: Record<string, string>;
   manageBankConfig: boolean;
   observationScopes: ObservationScopes;
-  banks: Record<string, Omit<RawConfig, "banks" | "harnesses"> & { bank?: string }>;
+  banks: NonNullable<RawConfig["banks"]>;
   logLevel: "debug" | "info" | "warn" | "error";
   autoUpdate: boolean;
 }
@@ -301,6 +317,45 @@ function resolveObservationScopes(raw: RawConfig["observationScopes"]): Observat
   return DEFAULT_OBSERVATION_SCOPES;
 }
 
+/** Keep invalid ownership visible to bank resolution: dropping it would select a legacy bank. */
+function resolvePrincipals(raw: RawConfig): PrincipalRegistryResult {
+  const invalid = (reason: string): PrincipalRegistryResult => ({ ok: false, reason });
+  const registry: unknown = raw.principals === undefined ? {} : raw.principals;
+  if (registry === null || typeof registry !== "object" || Array.isArray(registry))
+    return invalid("principals must be a registry of memory owners");
+  const entries: Record<string, PrincipalConfig> = {};
+  const banks = new Set<string>();
+  for (const [id, value] of Object.entries(registry)) {
+    if (
+      !/^[a-z][a-z0-9-]{0,63}$/.test(id) ||
+      !value ||
+      typeof value !== "object" ||
+      Array.isArray(value)
+    )
+      return invalid("Invalid principal entry: " + id);
+    const entry = value as Record<string, unknown>;
+    if (
+      typeof entry.bankId !== "string" ||
+      !entry.bankId.trim() ||
+      Object.keys(entry).some((key) => key !== "bankId")
+    )
+      return invalid("Invalid bank binding for principal: " + id);
+    const bankId = entry.bankId.trim();
+    if (banks.has(bankId)) return invalid("Principals must own distinct banks: " + bankId);
+    const overrides = raw.banks?.[bankId];
+    if (overrides?.bank !== undefined && overrides.bank !== bankId)
+      return invalid("Cannot redirect principal bank: " + bankId);
+    banks.add(bankId);
+    entries[id] = { bankId };
+  }
+  if (
+    raw.principal !== undefined &&
+    (typeof raw.principal !== "string" || !Object.hasOwn(entries, raw.principal.trim()))
+  )
+    return invalid("principal must select a registered memory owner");
+  return { ok: true, entries };
+}
+
 /** Apply defaults to a raw (file) config. Pure — the single place the defaults live. */
 export function resolveConfig(raw: RawConfig = {}): Config {
   const serverMode = ["cloud", "self-hosted", "daemon"].includes(raw.serverMode as string)
@@ -322,6 +377,8 @@ export function resolveConfig(raw: RawConfig = {}): Config {
     daemonProfile: raw.daemonProfile || DEFAULT_DAEMON_PROFILE,
     embedVersion: raw.embedVersion || undefined,
     embedPackagePath: raw.embedPackagePath || undefined,
+    principals: resolvePrincipals(raw),
+    principal: typeof raw.principal === "string" ? raw.principal.trim() : undefined,
     bankId: raw.bankId,
     dynamicBankId: raw.dynamicBankId,
     bankIdTemplate: raw.bankIdTemplate,
@@ -380,10 +437,14 @@ export function resolveConfig(raw: RawConfig = {}): Config {
 
 function readRaw(path: string): RawConfig {
   try {
-    return JSON.parse(readFileSync(path, "utf8")) as RawConfig;
+    const raw: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (!raw || typeof raw !== "object" || Array.isArray(raw))
+      throw new TypeError("Expected a configuration object");
+    return raw as RawConfig;
   } catch (e) {
     if ((e as NodeJS.ErrnoException)?.code !== "ENOENT") {
-      console.error(`hindsight: ignoring invalid config at ${path}: ${(e as Error)?.message || e}`);
+      console.error(`hindsight: cannot read config at ${path}; memory disabled`);
+      return { disabled: true };
     }
     return {};
   }
@@ -413,7 +474,11 @@ export interface LoadOptions {
 function applyLayer(raw: RawConfig, layer: RawConfig, harness?: string): RawConfig {
   let out = mergeRaw(raw, layer);
   const perHarness = harness ? layer.harnesses?.[harness] : undefined;
-  if (perHarness) out = mergeRaw(out, perHarness);
+  if (perHarness) {
+    const { principals: ignored, ...overrides } = perHarness as RawConfig;
+    if (ignored !== undefined) log.warn("config", "ignoring harness-local principals registry");
+    out = mergeRaw(out, overrides);
+  }
   return out;
 }
 
@@ -441,6 +506,7 @@ const ENV_KEYS = {
   embedPackagePath: "HINDSIGHT_EMBED_PACKAGE_PATH",
   daemonProfile: "HINDSIGHT_DAEMON_PROFILE",
   bankId: "HINDSIGHT_BANK_ID",
+  principal: "HINDSIGHT_PRINCIPAL",
   dynamicBankId: "HINDSIGHT_DYNAMIC_BANK_ID",
   bankIdTemplate: "HINDSIGHT_BANK_ID_TEMPLATE",
   resolveWorktrees: "HINDSIGHT_RESOLVE_WORKTREES",
@@ -547,6 +613,8 @@ export function loadConfig(opts: LoadOptions | string = {}): Config {
 /** Bank-resolution fields are meaningless inside a `banks.<id>` section (they can't change the id
  *  that selected it) — strip them so a typo there can't silently re-route memory. */
 const BANK_OVERRIDE_EXCLUDED = [
+  "principal",
+  "principals",
   "bankId",
   "bankIdTemplate",
   "mapPathToBank",

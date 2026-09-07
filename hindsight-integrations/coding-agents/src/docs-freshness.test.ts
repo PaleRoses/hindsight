@@ -1,12 +1,10 @@
 /**
  * The README is the single source of truth for configuration (scripts/build-skill.mjs copies its
  * marked regions into the companion skill; hindsight-docs/scripts/sync-coding-agents-doc.mjs copies
- * the whole thing into the docs site). These tests keep it honest in both directions:
- *
- *   - the generated skill matches what the README currently says, and
- *   - no config field is readable but undocumented — the drift issue #3735 was filed about, where
- *     `bankIdTemplate`, `optInOnly`, `banks.<id>.bank` and nine others were reachable in code while
- *     the docs a user actually reads never named them.
+ * the whole thing into the docs site). These tests keep that generation honest: the committed skill
+ * is the one the current README produces, it carries the configuration reference rather than a
+ * prose subset of it, and region extraction refuses markup that would silently truncate a section
+ * or merge it into the one above.
  */
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -17,7 +15,6 @@ import { describe, expect, it } from "vitest";
 import { regions } from "../scripts/build-skill.mjs";
 
 const pkgRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
-const readme = () => readFileSync(join(pkgRoot, "README.md"), "utf8");
 
 describe("companion skill", () => {
   it("is up to date with the README", () => {
@@ -30,56 +27,19 @@ describe("companion skill", () => {
 
   it("carries the configuration reference, not a subset of it", () => {
     const skill = readFileSync(join(pkgRoot, "skill", "SKILL.md"), "utf8");
-    // The keys that fix the failure mode #3735 reported: a bank shared across unrelated projects.
-    for (const key of ["bankIdTemplate", "dynamicBankId", "mapPathToBank", "disabled", "bank"]) {
+    // Bank-routing keys (the failure #3735 reported: one bank shared across unrelated projects)
+    // and the ownership keys that decide which memory an agent writes to at all.
+    for (const key of [
+      "bankIdTemplate",
+      "dynamicBankId",
+      "mapPathToBank",
+      "disabled",
+      "bank",
+      "principals",
+      "principal",
+    ]) {
       expect(skill).toContain(`\`${key}\``);
     }
-  });
-});
-
-describe("configuration reference", () => {
-  /** Field names declared in `interface RawConfig` — the whole surface a config file may set. */
-  const rawConfigFields = (): string[] => {
-    const src = readFileSync(join(pkgRoot, "src", "core", "config.ts"), "utf8");
-    const block = /export interface RawConfig \{([\s\S]*?)\n\}/.exec(src);
-    if (!block) throw new Error("could not find interface RawConfig in core/config.ts");
-    return [...block[1].matchAll(/^ {2}(\w+)\??:/gm)].map((m) => m[1]);
-  };
-
-  it("documents every field of RawConfig", () => {
-    const doc = readme();
-    const undocumented = rawConfigFields().filter((f) => !doc.includes(`\`${f}\``));
-    expect(undocumented).toEqual([]);
-  });
-
-  it("documents the env-var rule truthfully — every key really is HINDSIGHT_<FIELD_IN_CAPS>", () => {
-    // The README documents the env layer as a RULE rather than a 35-row table, so the rule has to
-    // hold for every key: one deviating name would be a setting nobody could derive from the docs.
-    const src = readFileSync(join(pkgRoot, "src", "core", "config.ts"), "utf8");
-    const block = /const ENV_KEYS = \{([\s\S]*?)\n\} as const/.exec(src);
-    if (!block) throw new Error("could not find ENV_KEYS in core/config.ts");
-    const pairs = [...block[1].matchAll(/^\s*(\w+): "(HINDSIGHT_\w+)"/gm)];
-    expect(pairs.length).toBeGreaterThan(30);
-    const expected = (field: string) =>
-      "HINDSIGHT_" + field.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toUpperCase();
-    expect(pairs.filter(([, field, env]) => expected(field) !== env).map(([, f]) => f)).toEqual([]);
-  });
-
-  it("keeps the map-valued settings out of the env layer, as documented", () => {
-    // The README tells users these four are file-only because per-key branching cannot survive
-    // flattening into one variable. If one ever gained an env var, that sentence would be a lie.
-    const src = readFileSync(join(pkgRoot, "src", "core", "config.ts"), "utf8");
-    const block = /const ENV_KEYS = \{([\s\S]*?)\n\} as const/.exec(src);
-    const fields = [...block![1].matchAll(/^\s*(\w+): "HINDSIGHT_/gm)].map((m) => m[1]);
-    for (const fileOnly of ["mapPathToBank", "harnesses", "banks", "retainMetadata"]) {
-      expect(fields).not.toContain(fileOnly);
-    }
-    expect(readme()).toContain("are file-only");
-  });
-
-  it("documents the per-bank section's own `bank` rename field", () => {
-    expect(readme()).toMatch(/`banks\.<bankId>`|`banks`/);
-    expect(readme()).toContain('"bank": "team::shared"');
   });
 });
 

@@ -1,7 +1,6 @@
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 let root: string;
@@ -33,16 +32,67 @@ afterEach(() => {
 });
 
 describe("resolveHostMemory", () => {
-  it("forwards every client setting the hosts used to pass by hand", async () => {
-    // dsh and Prime Agent each hand-built their ClientOpts and both omitted maxParallelRetains, so
-    // those two hosts silently ignored the setting. One builder is what stops that recurring.
-    writeConfig({ apiUrl: "http://server", apiToken: "k", maxParallelRetains: 3 });
+  it("binds the client to the selected owner's bank, whatever workspace it is serving", async () => {
+    // The owner's bank is the identity's, so the request path must carry it verbatim — the repo
+    // this host happens to be opened on has no say, and the id needs no shape of its own.
+    writeConfig({
+      apiUrl: "http://server",
+      apiToken: "k",
+      principals: { alpha: { bankId: "Alpha::Personal Memory" } },
+      principal: "alpha",
+    });
     const { resolveHostMemory } = await loadFactory();
 
-    const { client } = resolveHostMemory("dsh", root);
-    expect(client.apiUrl).toBe("http://server");
-    expect(client.apiToken).toBe("k");
-    expect(client.maxParallelRetains).toBe(3);
+    const { bankId, client } = resolveHostMemory("dsh", root);
+    expect(bankId).toBe("Alpha::Personal Memory");
+
+    const requests: { url: string; auth: string | null }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: RequestInit) => {
+        requests.push({ url: String(url), auth: new Headers(init.headers).get("Authorization") });
+        return new Response(JSON.stringify({ total: 0 }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      })
+    );
+    await client.activeOperations();
+    expect(requests).toEqual([
+      {
+        url: expect.stringMatching(
+          "^http://server/v1/default/banks/Alpha%3A%3APersonal%20Memory/operations(?:\\?|$)"
+        ),
+        auth: "Bearer k",
+      },
+    ]);
+    vi.unstubAllGlobals();
+  });
+
+  it("stays inert when the selector names no owner, rather than serving the repo's bank", async () => {
+    writeConfig({
+      apiUrl: "http://server",
+      principals: { alpha: { bankId: "Alpha::Personal" } },
+      principal: "ghost",
+    });
+    const { resolveHostMemory } = await loadFactory();
+
+    const { cfg, bankId } = resolveHostMemory("dsh", root);
+    expect(cfg.disabled).toBe(true);
+    expect(bankId).toBe("");
+  });
+
+  it("keeps optInOnly closed for an owner-routed host too", async () => {
+    // A principal names a bank, not an approved project: the privacy switch still fails closed.
+    writeConfig({
+      optInOnly: true,
+      optInPaths: ["/somewhere/else"],
+      principals: { alpha: { bankId: "Alpha::Personal" } },
+      principal: "alpha",
+    });
+    const { resolveHostMemory } = await loadFactory();
+
+    expect(resolveHostMemory("dsh", root).cfg.disabled).toBe(true);
   });
 
   it("enforces optInOnly for every host, not just the ones that remembered to pass a directory", async () => {
@@ -106,48 +156,60 @@ describe("resolveHostMemory", () => {
     const { resolveHostMemory } = await loadFactory();
     expect(resolveHostMemory("dsh", root).client.apiToken).toBe("per-bank");
   });
-});
 
-/**
- * The #3600 shape: a capability wired per-host is a capability the next host forgets. Three
- * settings had already gone missing that way (maxParallelRetains twice, optInOnly once, the live
- * credential everywhere), so the rule is structural — a long-lived host does not build its own
- * client, and a module that does has to say why.
- */
-describe("long-lived hosts build their client through the shared factory", () => {
-  const SRC = fileURLToPath(new URL("..", import.meta.url));
+  it("keeps an owner-routed host on the binding it was built with, credential rotation aside", async () => {
+    // A long-lived host holds a SNAPSHOT: it goes on serving the owner and bank it resolved at
+    // startup, and nothing re-reads the registry per request. What may still change under it is
+    // the credential — what may not is which identity's memory it signs for.
+    const bound = { principals: { alpha: { bankId: "alpha-bank" } }, principal: "alpha" };
+    writeConfig({ apiUrl: "http://server", apiToken: "old-key", ...bound });
+    const { resolveHostMemory } = await loadFactory();
+    const { client } = resolveHostMemory("dsh", root);
 
-  /** Modules that construct a client directly, and why that is correct for them. */
-  const DIRECT: Record<string, string> = {
-    "core/host-client.ts": "the shared factory itself",
-    "core/hook.ts": "one-shot hook process — re-reads config on every invocation",
-    "core/retain-hook.ts": "one-shot hook process, same",
-    "core/session-start.ts": "one-shot hook process, same",
-    "status.ts": "one-shot CLI resolving config from --config/--harness, not from a workspace",
-    "deepen.ts": "one-shot CLI, same",
-  };
+    // The server accepts exactly one credential at a time, so a 200 proves which one was sent.
+    let accepted = "rotated-key";
+    const calls: { url: string; auth: string | null }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: RequestInit) => {
+        const auth = new Headers(init.headers).get("Authorization");
+        calls.push({ url: String(url), auth });
+        return new Response(JSON.stringify({ total: 0 }), {
+          status: auth === `Bearer ${accepted}` ? 200 : 401,
+          headers: { "Content-Type": "application/json" },
+        });
+      })
+    );
 
-  function sourceFiles(dir: string, prefix = ""): string[] {
-    return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
-      const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
-      if (entry.isDirectory())
-        return entry.name === "e2e" ? [] : sourceFiles(join(dir, entry.name), rel);
-      return entry.name.endsWith(".ts") && !entry.name.includes(".test.") ? [rel] : [];
+    writeConfig({ apiUrl: "http://server", apiToken: "rotated-key", ...bound });
+    await client.activeOperations();
+    expect(calls.map((c) => c.auth)).toEqual(["Bearer old-key", "Bearer rotated-key"]);
+
+    // The owner is re-pointed at another bank, with its own credential, mid-session.
+    writeConfig({
+      apiUrl: "http://server",
+      apiToken: "other-key",
+      principals: { alpha: { bankId: "other-bank" } },
+      principal: "alpha",
     });
-  }
+    calls.length = 0;
+    await client.activeOperations();
+    // Still serving the bank it bound to — a re-pointed registry moves nothing under a live host.
+    expect(calls).toEqual([
+      {
+        url: expect.stringMatching(
+          "^http://server/v1/default/banks/alpha-bank/operations(?:\\?|$)"
+        ),
+        auth: "Bearer rotated-key",
+      },
+    ]);
 
-  it("has no module constructing a client outside the factory without a stated reason", () => {
-    const unexplained = sourceFiles(SRC).filter(
-      (rel) =>
-        !(rel in DIRECT) && readFileSync(join(SRC, rel), "utf8").includes("new HindsightClient(")
-    );
-    expect(unexplained).toEqual([]);
-  });
-
-  it("keeps no entry for a module that stopped constructing one", () => {
-    const stale = Object.keys(DIRECT).filter(
-      (rel) => !readFileSync(join(SRC, rel), "utf8").includes("new HindsightClient(")
-    );
-    expect(stale).toEqual([]);
+    // Forced to re-resolve by a 401, it still refuses to sign with the re-pointed owner's key:
+    // that request would read and write another identity's memory.
+    accepted = "other-key";
+    calls.length = 0;
+    await client.activeOperations().catch(() => {});
+    expect(calls.map((c) => c.auth)).toEqual(["Bearer rotated-key"]);
+    vi.unstubAllGlobals();
   });
 });

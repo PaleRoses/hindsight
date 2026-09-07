@@ -409,9 +409,14 @@ Environment variables are a **fallback**: the file wins wherever it sets a value
 an existing setup changes nothing. The two list-valued settings, `retainTags` and `optInPaths`, take
 a comma-separated value (`HINDSIGHT_RETAIN_TAGS="project:{gitProject},env:work"`); entries are
 trimmed and blanks dropped.
-The map-valued settings (`mapPathToBank`, `harnesses`, `banks`, `retainMetadata`) are file-only —
-per-key branching doesn't survive flattening into one variable. `maxParallelRetains` is available
-as `HINDSIGHT_MAX_PARALLEL_RETAINS` for containers and CI.
+The map-valued settings (`mapPathToBank`, `harnesses`, `banks`, `retainMetadata`, `principals`) are
+file-only — per-key branching doesn't survive flattening into one variable. `maxParallelRetains` is
+available as `HINDSIGHT_MAX_PARALLEL_RETAINS` for containers and CI.
+
+A file that is **not there** is the zero-setup case: defaults apply and every project gets memory. A
+file that is there but cannot be read — malformed JSON, or a top level that isn't an object — makes
+memory **inert** instead (the reason is printed, and nothing is recalled or retained). Routing is
+what the file decides, so a half-read config must not be answered with default routing.
 
 `HINDSIGHT_CONFIG` moves the file itself — point it at another path for a container or a test
 harness where `$HOME` is not the right anchor. It is still exactly one file; only its location
@@ -435,8 +440,16 @@ otherwise a rotation would leave a long-running agent failing every memory call 
 restarted. Everything else follows the table: `apiUrl`, `disabled`, bank routing, `gitIngest`, and
 the survey and knowledge-page settings.
 
-`hindsight_diagnose` reports both sides of that gap — what the file says now, and what the running
-client is actually using.
+**A running host keeps the owner and bank it started with.** Editing `principal` or `principals`
+under a live session does not move it: hook harnesses pick the change up on the next prompt, while a
+persistent plugin or MCP server keeps writing where it was bound until it restarts. So a change of
+owner is a quiescence-then-restart operation — let the sessions on the old owner finish, then start
+new ones — which is what keeps one session's work out of another owner's memory. Token rotation is
+the deliberate exception above: the credential may change under a live host, the identity may not.
+
+`hindsight_diagnose` reports both sides of that gap — what the file says now, what the running
+client is actually using, and which owner it is bound to (see
+[Who the memory belongs to](#who-the-memory-belongs-to--principals-and-principal)).
 
 ### Opt-in only
 
@@ -486,6 +499,8 @@ hook by Codex...), so one shared config serves several agents side by side:
 | ----------------------- | ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `apiUrl`                | `https://api.hindsight.vectorize.io` | Hindsight API base URL (set to `http://localhost:8888` for a local server)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `apiToken`              | —                                    | bearer token (Hindsight Cloud). Picked up without restarting the agent: a long-lived host re-reads it after a rejected request, so enabling auth or rotating the key mid-session recovers on the next call                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `principals`            | —                                    | registry of memory **owners**: `{"alpha": {"bankId": "alpha-memory"}}`. File-only and top-level-only — a `harnesses.<name>` copy is ignored with a warning, and a `banks.<id>` section can neither define owners nor redirect one's bank. Ids match `^[a-z][a-z0-9-]{0,63}$`, each `bankId` is non-empty, and two owners may not name the same bank — see [Who the memory belongs to](#who-the-memory-belongs-to--principals-and-principal)                                                                                                                                                                                                                                                  |
+| `principal`             | —                                    | which registered owner this agent **is**. Selected per harness (`harnesses.<name>.principal`) or once at the top level; `HINDSIGHT_PRINCIPAL` is the env fallback. Set ⇒ that owner's bank, decided before `mapPathToBank`, `bankId` and the dynamic template. A name that no registry entry declares makes memory inert rather than falling back                                                                                                                                                                                                                                                                                                                                            |
 | `bankId`                | —                                    | **explicit static bank**; unset ⇒ per-repo dynamic resolution (below)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `dynamicBankId`         | dynamic iff no `bankId`              | force dynamic (`true`) or static (`false`) resolution                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `bankIdTemplate`        | `"coding-agent::{gitProject}"`       | dynamic bank id format; the default makes every agent share one bank per repo                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
@@ -613,12 +628,16 @@ the boundary ("everything I clone under `work/client-x` shares memory").
 
 ### Bank resolution
 
-Coding memory is **per repository**. Resolution order for the working directory:
+Coding memory is **per repository**, unless an owner claims it. Resolution order for the working
+directory:
 
-1. `mapPathToBank` — longest matching absolute-path prefix (mapping a repo root covers every
+1. Owner — `principal` names a registered entry of `principals`, and that entry's bank is the
+   answer (see [Who the memory belongs to](#who-the-memory-belongs-to--principals-and-principal)).
+   Nothing below is consulted; an owner's memory does not change with the directory.
+2. `mapPathToBank` — longest matching absolute-path prefix (mapping a repo root covers every
    subdirectory; deeper mappings win; overrides even an explicit `bankId`).
-2. Static — `bankId` set (or `dynamicBankId: false`).
-3. Dynamic — `bankIdTemplate` with placeholders:
+3. Static — `bankId` set (or `dynamicBankId: false`).
+4. Dynamic — `bankIdTemplate` with placeholders:
    - `{gitProject}` — worktree-aware repo name: `git rev-parse --git-common-dir` resolves every
      linked worktree to the **main** worktree's basename, so all worktrees of a repo share one bank
      (bare repos use the bare dir name). **Outside a repo** there is nothing for git to resolve, so
@@ -631,6 +650,47 @@ Coding memory is **per repository**. Resolution order for the working directory:
 
 The default `"coding-agent::{gitProject}"` is **harness-neutral**, so opencode, Claude Code, and Codex
 all share one memory per repo — use `"{harness}-{gitProject}"` to split per agent instead.
+
+### Who the memory belongs to — `principals` and `principal`
+
+To keep independent histories across the same repositories, register stable memory owners and
+select one per harness. Model and harness names do not define ownership:
+
+```jsonc
+{
+  "principals": {
+    "alpha": { "bankId": "alpha-memory" },
+    "beta": { "bankId": "beta-memory" },
+  },
+  "harnesses": {
+    "claude-code": { "principal": "alpha" },
+    "codex": { "principal": "beta" },
+  },
+}
+```
+
+Set `principal` at the top level or per harness; `HINDSIGHT_PRINCIPAL` is its environment
+fallback. Multiple harnesses may select one owner and share its bank, retaining their own
+`harness:` provenance. An owner's bank stays fixed across repositories; project opt-in still
+applies. Without a selected owner, existing repository routing is unchanged.
+
+`principals` is file-only and top-level. Harness-local registries are ignored with a warning;
+`banks.<id>` cannot replace the registry or selector. IDs match `^[a-z][a-z0-9-]{0,63}$`.
+Each entry contains only a nonempty `bankId`; distinct owners must have distinct banks.
+Invalid registries, unknown selectors, and bank aliases redirecting an owner disable memory
+with a diagnostic, never a fallback bank.
+
+Separate banks keep recall and consolidation bank-local; they do not authorize callers. This
+registry is client routing, not a sandbox: credentials with access to another bank can still use
+it. Separation prevents ambient mixing of histories, not every cause of poor context quality.
+
+Every document written under an owner is stamped with the `principal:<id>` tag and a `principal`
+metadata key. That namespace is reserved alongside `source:` and `harness:`, so a `retainTags` or
+`retainMetadata` entry can neither set nor forge it and the stamp always names the owner that
+actually wrote the document. `hindsight_diagnose` reports `principal` (the owner this host is bound
+to), `config.principal` (what the file selects now) and `config.principal_matches_binding` (whether
+that configured owner _and_ its bank are the ones in use) — the last is `false` after an edit the
+host has not been restarted into.
 
 ### Recording where a memory came from
 
@@ -654,8 +714,9 @@ of. Both accept the same placeholders as `bankIdTemplate` — `{gitProject}`, `{
 `{gitProject}` is worktree-aware here too, so every linked worktree of a repo stamps one name.
 `{sessionId}` resolves to `unknown` for documents that do not originate from an agent session.
 
-The plugin's own `source:` and `harness:` tags are reserved: entries in those namespaces are ignored
-with a warning, so a document's agent attribution always reflects the agent that actually wrote it.
+The plugin's own `source:`, `harness:` and `principal:` tags are reserved: entries in those
+namespaces are ignored with a warning, so a document's attribution always names the agent and owner
+that actually wrote it.
 
 ### One set of beliefs per repo
 
@@ -752,11 +813,11 @@ correcting a wrong memory — lives outside it, in `skill-src/preamble.md`.
 npm run skill:build   # after editing this README or the preamble
 ```
 
-`src/docs-freshness.test.ts` fails when the skill is stale, and when a field of `RawConfig` is
-readable from a config file but named nowhere in this README — the drift that produced #3735, where
-the skill and the README each documented a different subset of the same settings. The docs site page
-is generated from this file too (`node hindsight-docs/scripts/sync-coding-agents-doc.mjs`), which
-drops the markers along with the contributor-only sections.
+`src/docs-freshness.test.ts` fails when the committed skill is not the one this README currently
+produces, and when the skill has lost the configuration reference — the drift that produced #3735,
+where the skill and the README each documented a different subset of the same settings. The docs
+site page is generated from this file too (`node hindsight-docs/scripts/sync-coding-agents-doc.mjs`),
+which drops the markers along with the contributor-only sections.
 
 <!-- skill:begin -->
 

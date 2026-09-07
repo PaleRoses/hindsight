@@ -10,6 +10,17 @@ For the source code, see [`hindsight-integrations/coding-agents`](https://github
 
 ← [Back to main changelog](../index.md)
 
+## Unreleased
+
+**Features**
+
+- Added memory owners. A `principals` registry names each owner and the bank it owns, and `principal` — top level, per harness, or `HINDSIGHT_PRINCIPAL` — says which owner an agent is. The owner's bank is chosen ahead of path, static and dynamic bank resolution and does not change with the repository, so agents sharing one machine keep separate experience, while one owner selected from several harnesses keeps a single history. Documents written under an owner carry a reserved `principal:<id>` tag and `principal` metadata that user tags cannot forge, and `hindsight_diagnose` reports the owner a running host is bound to next to the one the config selects now.
+
+**Improvements**
+
+- An unknown owner, or a `principals` registry with an invalid id, an unusable bank binding, or two owners on one bank, now leaves the session inert with the reason recorded instead of quietly resolving the per-repo bank. Changing owners applies when the agent restarts; a running host keeps the owner and bank it started with.
+- A config file that exists but cannot be read — malformed JSON, or a top level that is not an object — now disables memory instead of continuing with default bank routing. A missing config file is unchanged: defaults apply and every project gets memory.
+
 ## [0.5.1](https://github.com/vectorize-io/hindsight/tree/integrations/coding-agents/v0.5.1)
 
 **Bug Fixes**

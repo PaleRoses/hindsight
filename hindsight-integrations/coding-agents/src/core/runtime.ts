@@ -79,6 +79,7 @@ export class RuntimeCore {
     return buildKnowledgeTools(this.client, this.bankId, {
       repoDir: this.projectDir,
       harness: this.harness,
+      principal: this.cfg.principal,
       pageTrigger: buildPageTrigger(this.cfg),
       reflectTimeoutMs: this.cfg.reflectToolTimeoutMs,
       reflectBudget: this.cfg.reflectBudget,

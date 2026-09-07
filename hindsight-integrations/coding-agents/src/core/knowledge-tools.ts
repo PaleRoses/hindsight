@@ -99,6 +99,8 @@ export function buildKnowledgeTools(
   opts: {
     repoDir?: string;
     harness?: string;
+    /** The owner captured when this host bound its client, not a live config lookup. */
+    principal?: string;
     stampFor?: () => RetainStamp;
     /** Refresh policy for a page `hindsight_capture_initiative` creates (core/missions.ts). */
     pageTrigger?: PageTrigger;
@@ -152,6 +154,7 @@ export function buildKnowledgeTools(
         ).cfg;
         return ok({
           bank_id: bankId,
+          principal: opts.principal ?? null,
           harness,
           workspace: opts.repoDir ?? process.cwd(),
           config: {
@@ -160,6 +163,11 @@ export function buildKnowledgeTools(
             api_url: cfg.apiUrl,
             api_token_configured: Boolean(cfg.apiToken),
             disabled: cfg.disabled,
+            principal: cfg.principal ?? null,
+            principal_matches_binding:
+              cfg.principals.ok &&
+              cfg.principal === opts.principal &&
+              (!cfg.principal || cfg.principals.entries[cfg.principal]?.bankId === bankId),
           },
           // What the LIVE client is signing with, which is not the same question as what the file
           // says. A long-lived host used to keep a credential the config had already replaced, and

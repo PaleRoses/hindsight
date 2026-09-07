@@ -124,3 +124,39 @@ describe("buildRetainStamp", () => {
     expect(tags[0]).toBe(`t:${metadata.at}`);
   });
 });
+
+/**
+ * The one stamp that is not opt-in. An owner's bank collects work from many repositories, agents
+ * and sessions, so the owner is what makes a memory attributable at all — and a memory that names
+ * an owner which did not write it is worse than one that names none.
+ */
+describe("buildRetainStamp — principal provenance", () => {
+  it("stamps the bound owner with no stamp settings configured at all", () => {
+    expect(buildRetainStamp({ principal: "alpha" }, ctx())).toEqual({
+      tags: ["principal:alpha"],
+      metadata: { principal: "alpha" },
+    });
+  });
+
+  it("keeps the bound owner alongside configured provenance", () => {
+    const { tags, metadata } = buildRetainStamp(
+      { principal: "alpha", retainTags: ["env:work"], retainMetadata: { repo: "acme" } },
+      ctx()
+    );
+    expect(tags).toEqual(["env:work", "principal:alpha"]);
+    expect(metadata).toEqual({ repo: "acme", principal: "alpha" });
+  });
+
+  it("cannot be forged by configuration — bound or not", () => {
+    const forged = {
+      retainTags: ["principal:worker", "env:work"],
+      retainMetadata: { principal: "worker" },
+    };
+    expect(buildRetainStamp({ ...forged, principal: "alpha" }, ctx())).toEqual({
+      tags: ["env:work", "principal:alpha"],
+      metadata: { principal: "alpha" },
+    });
+    // Unbound, the claim is dropped rather than left standing: nothing wrote this as an owner.
+    expect(buildRetainStamp(forged, ctx())).toEqual({ tags: ["env:work"], metadata: {} });
+  });
+});

@@ -12,7 +12,10 @@ explains what happens automatically, which tools you have, and how to configure 
 ## What happens automatically (no action needed)
 
 - **Per-repo memory bank**: each repository resolves to a bank (shown in the session banner:
-  `↳ memory bank “coding-agent::<repo>”`). Worktrees share the main repo's bank.
+  `↳ memory bank “coding-agent::<repo>”`). Worktrees share the main repo's bank. When the config
+  names a memory **owner** (`principal`), that owner's bank is used instead and stays the same in
+  every repository — one agent's experience, not one project's. Documents written under an owner
+  carry a `principal:<id>` tag you cannot set yourself.
 - **Ingestion builds itself**: on first open, the bank is seeded from recent commit messages and a
   read-only codebase survey; every session start, a background engine tops it up (new commits, new
   conversations) and keeps 5 knowledge pages current. There is NO ingest command to run.

@@ -1,31 +1,14 @@
 /**
- * Dynamic bank resolution — which memory bank does THIS directory belong to?
+ * Resolve memory ownership before repository-based routing:
+ *   1. selected principal's explicit bank;
+ *   2. longest mapPathToBank prefix (including linked worktrees);
+ *   3. static bankId;
+ *   4. bankIdTemplate, default "coding-agent::{gitProject}".
  *
- * Coding memory is per-REPOSITORY: by default the bank id is derived from the git repo the
- * working directory lives in, worktree-aware — every linked worktree of a repo resolves to the
- * main worktree's basename and therefore shares one bank.
- *
- * Resolution order:
- *   1. `mapPathToBank` — absolute path -> bank; LONGEST matching prefix wins, so mapping a
- *      repo root covers every subdirectory and linked worktree of that repo.
- *      Overrides everything, including an explicit bankId.
- *   2. static — when `dynamicBankId` is false, or left unset WITH an explicit `bankId`
- *      (the benchmark harness and single-bank setups).
- *   3. dynamic — `bankIdTemplate` (default "coding-agent::{gitProject}") with placeholders:
- *        {gitProject}  worktree-aware repo name (all worktrees share it; outside a repo: the
- *                      basename of the directory the SESSION started in, not the agent's live cwd)
- *        {project}     working-directory basename (no git involved)
- *        {harness}     the entry point asking ("opencode", "claude-code", "codex", "antigravity-cli", ...)
- *        {channel}     $HINDSIGHT_CHANNEL_ID or "default"
- *        {user}        $HINDSIGHT_USER_ID or "anonymous"
- *      e.g. "hindsight-{gitProject}" or "{harness}-{gitProject}" to split per agent. The default
- *      is harness-neutral "coding-agent::{gitProject}" so every coding agent shares ONE memory per repo.
- *
- * The repository probe (core/git-layout.ts) reads the repository layout off disk and answers one
- * of three things: this repo, no repo, or "could not tell". Only "no repo" reaches the basename
- * fallback — a probe that FAILED makes resolution throw `BankResolutionError`, and the lifecycle
- * hooks skip the session (`deriveBankIdOrSkip`). Guessing there is how a linked worktree ended up
- * with a permanent bank of its own (#3950): a skipped session is recoverable, a scattered one is not.
+ * Templates admit {gitProject}, {project}, {harness}, {channel}, and {user}.
+ * gitProject names the main worktree; outside Git it uses the session-root basename.
+ * An invalid owner or failed repository probe raises BankResolutionError rather than
+ * inventing a fallback bank. Lifecycle callers use deriveBankIdOrSkip to become inert.
  */
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -35,7 +18,11 @@ import { probeGitLayout } from "./git-layout";
 import { log } from "./log";
 import { applyTemplate } from "./template";
 
+import type { PrincipalRegistryResult } from "./config";
+
 export interface BankConfig {
+  principal?: string;
+  principals?: PrincipalRegistryResult;
   bankId?: string;
   dynamicBankId?: boolean;
   bankIdTemplate?: string;
@@ -64,9 +51,7 @@ export type ProjectRoot =
   | { status: "absent" }
   | { status: "failed"; reason: string };
 
-/** Thrown when a repository could not be identified because the PROBE failed. Callers on the
- *  retain path skip the session rather than invent a bank: a skipped session is recoverable, a
- *  session scattered into a bank nobody reads is not. */
+/** An unresolved owner or repository must stop memory, never invent a fallback bank. */
 export class BankResolutionError extends Error {
   constructor(message: string) {
     super(message);
@@ -293,6 +278,16 @@ export function deriveBankId(
    *  entry this directory inherits (lookupDirectories). */
   sessionRoot?: string
 ): string {
+  if (config.principals && !config.principals.ok)
+    throw new BankResolutionError(config.principals.reason);
+  if (config.principal !== undefined) {
+    const owner =
+      config.principals?.ok && Object.hasOwn(config.principals.entries, config.principal)
+        ? config.principals.entries[config.principal]
+        : undefined;
+    if (!owner) throw new BankResolutionError("principal must select a registered memory owner");
+    return owner.bankId;
+  }
   const mapped = mappedBank(config, directory, sessionRoot);
   if (mapped) return mapped;
 
@@ -332,7 +327,8 @@ export function bankProjectName(
   directory: string,
   sessionRoot?: string
 ): string | undefined {
-  if (mappedBank(config, directory, sessionRoot)) return undefined;
+  if (config.principal !== undefined || mappedBank(config, directory, sessionRoot))
+    return undefined;
 
   const dynamic = config.dynamicBankId ?? !config.bankId;
   if (!dynamic) return undefined;
@@ -370,7 +366,7 @@ export function deriveBankIdOrSkip(
     return deriveBankId(config, directory, harness, sessionRoot);
   } catch (error) {
     if (!(error instanceof BankResolutionError)) throw error;
-    log.warn(harness, "bank unresolved: skipping (repository could not be identified)", {
+    log.warn(harness, "bank unresolved: memory disabled", {
       directory,
       error: error.message,
     });

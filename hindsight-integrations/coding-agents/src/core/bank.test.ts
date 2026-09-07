@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // id derived from it. Real repositories are covered by bank-bare-hub / bank-missing-dir.
 vi.mock("./git-layout", () => ({ probeGitLayout: vi.fn() }));
 
-import { deriveBankId } from "./bank";
+import { BankResolutionError, deriveBankId, deriveBankIdOrSkip } from "./bank";
 import { probeGitLayout } from "./git-layout";
 
 const mockProbe = vi.mocked(probeGitLayout);
@@ -144,5 +144,75 @@ describe("mapPathToBank ~ expansion", () => {
     const cfg = { mapPathToBank: { "~/scratch-zone": "scratch" } } as never;
     expect(deriveBankId(cfg, `${process.env.HOME}/scratch-zone/some/repo`)).toBe("scratch");
     expect(deriveBankId(cfg, "/elsewhere/scratch-zone")).not.toBe("scratch");
+  });
+});
+
+/**
+ * A principal is a memory OWNER, so its bank is a property of the IDENTITY and never of the
+ * directory: the registry answers before anything looks at the filesystem, and a selector or
+ * registry that cannot be trusted refuses rather than falls back. Falling back would write one
+ * identity's memory into a per-repo bank it never reads from again.
+ *
+ * Validation lives in core/config (`resolveConfig` -> `Config.principals`), so these cases state
+ * the RESOLVED registry rather than raw file JSON.
+ */
+describe("principal routing", () => {
+  const entries = { alpha: { bankId: "Alpha::Personal Memory" }, worker: { bankId: "archive" } };
+  const owned = (principal?: string) => ({
+    principals: { ok: true as const, entries },
+    ...(principal === undefined ? {} : { principal }),
+  });
+
+  beforeEach(() => {
+    mockProbe.mockReturnValue({ status: "absent" });
+  });
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("routes the selected owner to its registered bank, verbatim", () => {
+    // The bank id is the user's string, not a template result: no namespacing, no normalisation.
+    expect(deriveBankId(owned("alpha"), "/home/me/dev/myrepo")).toBe("Alpha::Personal Memory");
+    expect(deriveBankId(owned("worker"), "/home/me/dev/myrepo")).toBe("archive");
+  });
+
+  it("outranks every path-derived route, and never consults the repository", () => {
+    mockProbe.mockReturnValue(inRepo("/home/me/dev/myrepo/.git"));
+    const cfg = {
+      ...owned("alpha"),
+      bankId: "static",
+      bankIdTemplate: "{gitProject}",
+      mapPathToBank: { "/home/me/dev": "mapped" },
+    };
+    expect(deriveBankId(cfg, "/home/me/dev/myrepo")).toBe("Alpha::Personal Memory");
+    expect(mockProbe).not.toHaveBeenCalled();
+  });
+
+  it("is unmoved by a probe that cannot name the repository", () => {
+    // The failure that makes the legacy route refuse to guess (#3950) is simply not a question an
+    // owner-routed session asks.
+    mockProbe.mockReturnValue({ status: "failed", reason: "EAGAIN" });
+    expect(deriveBankId(owned("alpha"), "/home/me/dev/myrepo-wt")).toBe("Alpha::Personal Memory");
+  });
+
+  it("leaves the legacy per-repo route untouched when no owner is selected", () => {
+    mockProbe.mockReturnValue(inRepo("/home/me/dev/myrepo/.git"));
+    expect(deriveBankId(owned(), "/home/me/dev/myrepo-wt")).toBe("coding-agent::myrepo");
+  });
+
+  it("refuses an unknown selector instead of routing the identity somewhere else", () => {
+    expect(() => deriveBankId(owned("ghost"), "/home/me/dev/myrepo")).toThrow(BankResolutionError);
+    expect(deriveBankIdOrSkip(owned("ghost"), "/home/me/dev/myrepo", "claude-code")).toBeNull();
+  });
+
+  it("refuses a registry the config layer rejected — selected or not", () => {
+    // `{ ok: false }` reaches resolution precisely so a broken registry cannot read as "no
+    // principals configured", which is the shape that would resolve a legacy bank instead.
+    const broken = { principals: { ok: false as const, reason: "rejected" } };
+    expect(() => deriveBankId({ ...broken, principal: "alpha" }, "/home/me/dev/myrepo")).toThrow(
+      BankResolutionError
+    );
+    expect(() => deriveBankId(broken, "/home/me/dev/myrepo")).toThrow(BankResolutionError);
+    expect(deriveBankIdOrSkip(broken, "/home/me/dev/myrepo", "claude-code")).toBeNull();
   });
 });

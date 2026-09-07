@@ -67,7 +67,18 @@ export function resolveHostMemory(harness: string, directory: string): HostMemor
       // rotate the key mid-session and the snapshot 401s every call until restart (#3600). Read
       // through the same pipeline the constructor used, so a per-bank `banks.<id>.apiToken` is
       // honoured on re-resolution exactly as it was on the first one.
-      tokenProvider: () => resolveHostConfig(harness, directory).cfg.apiToken,
+      tokenProvider: () => {
+        const next = resolveHostConfig(harness, directory);
+        if (
+          cfg.principal &&
+          (next.cfg.disabled ||
+            next.cfg.principal !== cfg.principal ||
+            next.bankId !== bankId ||
+            next.cfg.apiUrl !== cfg.apiUrl)
+        )
+          throw new Error("Memory binding changed; restart this host");
+        return next.cfg.apiToken;
+      },
     }),
   };
 }

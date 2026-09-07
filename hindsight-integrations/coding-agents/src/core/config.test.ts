@@ -29,12 +29,22 @@ describe("loadConfig layering", () => {
     expect(cfg.disabled).toBe(false);
   });
 
-  it("malformed global file falls back to defaults with a warning", () => {
+  it("an unreadable global file disables memory instead of routing on defaults", () => {
+    // Falling back to defaults answers a config nobody wrote: the per-repo bank, the cloud endpoint
+    // and every retain switch on. A file that cannot be parsed says nothing about where memory goes.
     writeFileSync(globalCfg, "{not json");
     const err = vi.spyOn(console, "error").mockImplementation(() => {});
-    const cfg = loadConfig({ path: globalCfg });
-    expect(cfg.apiUrl).toBe("https://api.hindsight.vectorize.io");
+    expect(loadConfig({ path: globalCfg }).disabled).toBe(true);
     expect(err).toHaveBeenCalledOnce();
+    err.mockRestore();
+  });
+
+  it("a JSON root that is not a config object disables memory too", () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    for (const body of ["null", "[]", '"coding-agent"']) {
+      writeFileSync(globalCfg, body);
+      expect(loadConfig({ path: globalCfg }).disabled).toBe(true);
+    }
     err.mockRestore();
   });
 
@@ -407,5 +417,132 @@ describe("observationScopes", () => {
       "per_tag"
     );
     expect(readEnvConfig({}).observationScopes).toBeUndefined();
+  });
+});
+
+/**
+ * A PRINCIPAL is a stable memory OWNER — an identity that keeps one bank whatever repository it is
+ * working in. The registry is that routing table, so a registry which cannot be trusted has to stay
+ * visibly broken: dropping the bad entry would silently hand the identity the per-repo legacy bank,
+ * which is the single outcome principals exist to prevent.
+ */
+describe("principals registry", () => {
+  it("is valid and empty when nothing is configured, leaving the legacy route untouched", () => {
+    const cfg = resolveConfig({});
+    expect(cfg.principals).toEqual({ ok: true, entries: {} });
+    expect(cfg.principal).toBeUndefined();
+  });
+
+  it("registers owners against arbitrary bank ids, trimmed, and trims the selector", () => {
+    const cfg = resolveConfig({
+      principals: {
+        alpha: { bankId: "  Alpha::Personal Memory  " },
+        worker: { bankId: "archive" },
+      },
+      principal: " alpha ",
+    });
+    expect(cfg.principals).toEqual({
+      ok: true,
+      entries: { alpha: { bankId: "Alpha::Personal Memory" }, worker: { bankId: "archive" } },
+    });
+    expect(cfg.principal).toBe("alpha");
+  });
+
+  it("takes an id up to 64 chars and refuses anything outside the id grammar", () => {
+    expect(resolveConfig({ principals: { ["a".repeat(64)]: { bankId: "b" } } }).principals.ok).toBe(
+      true
+    );
+    for (const id of [
+      "Alpha",
+      "1alpha",
+      "alpha_driver",
+      "-alpha",
+      "alpha.driver",
+      "",
+      "a".repeat(65),
+    ])
+      expect(resolveConfig({ principals: { [id]: { bankId: "b" } } }).principals.ok).toBe(false);
+  });
+
+  it("refuses an owner with no bank, or carrying anything but its bank", () => {
+    expect(resolveConfig({ principals: { alpha: { bankId: "   " } } }).principals.ok).toBe(false);
+    expect(resolveConfig({ principals: { alpha: {} as never } }).principals.ok).toBe(false);
+    // A principal entry is a binding, not a config layer: an apiToken smuggled in here would send
+    // one identity's memory to a different server without appearing anywhere the user looks.
+    expect(
+      resolveConfig({ principals: { alpha: { bankId: "b", apiToken: "t" } as never } }).principals
+        .ok
+    ).toBe(false);
+  });
+
+  it("refuses two owners of one bank — ownership is exclusive, an alias is not a route", () => {
+    // Aliased identities cannot be separated afterwards: their memories are already interleaved in
+    // one bank, and neither owner can be moved out without taking the other's work with it.
+    const cfg = resolveConfig({
+      principals: { alpha: { bankId: "shared" }, worker: { bankId: " shared " } },
+    });
+    expect(cfg.principals.ok).toBe(false);
+  });
+
+  it("refuses the registry as a whole, never just the offending entry", () => {
+    const cfg = resolveConfig({
+      principals: { alpha: { bankId: "ok" }, Bad: { bankId: "other" } },
+    });
+    expect(cfg.principals.ok).toBe(false);
+  });
+
+  it("refuses a registry that is not a registry", () => {
+    for (const registry of [null, [], "alpha", 7])
+      expect(resolveConfig({ principals: registry as never }).principals.ok).toBe(false);
+  });
+
+  it("refuses a selector that names no registered owner", () => {
+    const principals = { alpha: { bankId: "Alpha::Personal" } };
+    expect(resolveConfig({ principals, principal: "ghost" }).principals.ok).toBe(false);
+    expect(resolveConfig({ principals, principal: 7 as never }).principals.ok).toBe(false);
+    expect(resolveConfig({ principals, principal: "alpha" }).principals.ok).toBe(true);
+  });
+});
+
+describe("principals — the registry is the file's, the selector is the harness's", () => {
+  it("a harnesses.<name> section selects an owner but cannot replace the registry", () => {
+    // Harness sections are wiring, written per agent; letting one define owners would let a wiring
+    // change re-point an identity's memory while the user's registry still reads as authoritative.
+    writeJson(globalCfg, {
+      principals: { alpha: { bankId: "Alpha::Personal" } },
+      harnesses: {
+        "claude-code": {
+          principal: "alpha",
+          principals: { alpha: { bankId: "somewhere-else" } },
+        } as never,
+      },
+    });
+    const cfg = loadConfig({ path: globalCfg, harness: "claude-code" });
+    expect(cfg.principal).toBe("alpha");
+    expect(cfg.principals).toEqual({ ok: true, entries: { alpha: { bankId: "Alpha::Personal" } } });
+  });
+
+  it("a banks.<id> section cannot re-point the owner, and refuses to rename its bank", () => {
+    const owned = { alpha: { bankId: "Alpha::Personal" } };
+    // The rename is refused by invalidating the registry rather than ignored: a config that says
+    // the owner's memory lives elsewhere must not run as if it said nothing.
+    expect(
+      resolveConfig({
+        principals: owned,
+        principal: "alpha",
+        banks: { "Alpha::Personal": { bank: "elsewhere" } },
+      }).principals.ok
+    ).toBe(false);
+
+    const cfg = resolveConfig({
+      principals: owned,
+      principal: "alpha",
+      banks: { "Alpha::Personal": { principal: "worker", retainSessions: false } as never },
+    });
+    const out = applyBankConfig(cfg, "Alpha::Personal");
+    expect(out.bankId).toBe("Alpha::Personal");
+    expect(out.cfg.principal).toBe("alpha");
+    expect(out.cfg.principals).toEqual(cfg.principals);
+    expect(out.cfg.retainSessions).toBe(false); // behavioural fields still apply
   });
 });
