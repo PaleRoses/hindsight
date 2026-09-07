@@ -166,6 +166,12 @@ export class KnowledgePagesUnavailableError extends Error {
 
 const TERMINAL = new Set(["completed", "failed", "cancelled", "error"]);
 
+export interface DrainResult {
+  completed: number;
+  failed: number; // includes cancelled operations
+  pending: number; // completion unconfirmed at the deadline, including unavailable status
+}
+
 /** Default cap on concurrent retain-related requests; configurable via `maxParallelRetains`. */
 export const DEFAULT_MAX_PARALLEL_RETAINS = 10;
 
@@ -322,12 +328,10 @@ export class HindsightClient {
     const body: Record<string, unknown> = { items: [item], async: true };
     if (opts.operationId) body.operation_id = opts.operationId;
     const r = await this.req("POST", this.bankUrl("/memories"), body);
-    try {
-      const j = (await r.json()) as { operation_id?: string };
-      if (j.operation_id) this.opIds.push(j.operation_id);
-    } catch {
-      /* ignore */
-    }
+    const { operation_id } = (await r.json()) as { operation_id?: unknown };
+    if (!r.ok || typeof operation_id !== "string" || !operation_id.trim())
+      throw new Error("Async retain did not acknowledge an operation");
+    this.opIds.push(operation_id);
   }
 
   /**
@@ -442,45 +446,44 @@ export class HindsightClient {
     await this.req("DELETE", this.bankUrl(`/documents/${encodeURIComponent(documentId)}`));
   }
 
-  /** Count of operations still ACTIVE on this bank. Powers syncStatus's "extractions drained"
-   *  check. `active_only=true` narrows the endpoint's own `total`, so one `limit=1` probe is exact
-   *  at any backlog depth — where filtering a page saturates at its 20 rows, and a count per
-   *  non-terminal status is taken at two instants, so an op moving `pending` → `processing`
-   *  between them is missed by both and the pair reads zero on a working bank. A server too old
-   *  for the flag returns the whole table's total: an OVERCOUNT, which can never fake a drain.
-   *  A pending op deferred into the future (a held retry backlog) counts as active: the endpoint
-   *  exposes no next_retry_at filter, so "active" means "not yet terminal". */
+  /** Exact bank-wide non-terminal count, including deferred retries. Unavailable status rejects.
+   *  Older servers ignore active_only and overcount all operations; they cannot fake a drain. */
   async activeOperations(): Promise<number> {
-    try {
-      const r = await this.req("GET", this.bankUrl("/operations?active_only=true&limit=1"));
-      const j = (await r.json()) as { total?: number };
-      return typeof j.total === "number" ? j.total : 0;
-    } catch {
-      return 0;
-    }
+    const r = await this.req("GET", this.bankUrl("/operations?active_only=true&limit=1"));
+    if (!r.ok) throw new Error(`Operation count unavailable: HTTP ${r.status}`);
+    const { total } = (await r.json()) as { total?: unknown };
+    if (typeof total !== "number" || !Number.isSafeInteger(total) || total < 0)
+      throw new Error("Invalid operation count");
+    return total;
   }
 
   /**
-   * Poll each enqueued operation by id until terminal. LIST only shows active ops, so per-id GET is reliable.
+   * Poll this run's operations to terminal status or the deadline; unconfirmed ids remain pending.
    *
    * Concurrency is capped at `maxParallelRetains` (the API rate-limits bursts, not single
    * requests — a 200 to a lone GET with 429s under `Promise.all` over every pending op). A 429
    * leaves the op pending and backs the next cycle off by its `Retry-After` (10s floor) instead
    * of hammering the next cycle 5s later.
    */
-  async drain(ids: string[], label: string, maxMs = 60 * 60 * 1000): Promise<void> {
-    if (!ids.length) return;
-    this.log(`[wait] draining ${ids.length} ${label} operations …`);
-    const start = Date.now();
+  async drain(ids: string[], label: string, maxMs = 60 * 60 * 1000): Promise<DrainResult> {
     const pending = new Set(ids);
+    const total = pending.size;
+    if (!total) return { completed: 0, failed: 0, pending: 0 };
+    this.log(`[wait] draining ${total} ${label} operations …`);
+    const deadline = Date.now() + maxMs;
     let failed = 0;
-    while (pending.size && Date.now() - start < maxMs) {
+    while (pending.size && Date.now() < deadline) {
       // Cycle backoff: default 5s; any 429 in the cycle raises it to the longest Retry-After seen
       // (floor 10s) so a rate-limited API gets room to recover before the next poll round.
       let backoffMs = POLL_CYCLE_MS;
       await pool([...pending], this.maxParallelRetains, async (id) => {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return;
         try {
-          const r = await this.fetchWithAuth(this.bankUrl(`/operations/${id}`), { method: "GET" });
+          const r = await this.fetchWithAuth(this.bankUrl(`/operations/${id}`), {
+            method: "GET",
+            signal: AbortSignal.timeout(Math.min(15_000, remaining)),
+          });
           if (r.status === 429) {
             backoffMs = Math.min(
               RETRY_AFTER_CEILING_MS,
@@ -499,14 +502,15 @@ export class HindsightClient {
         }
       });
       if (pending.size) {
-        this.log(`  … ${pending.size}/${ids.length} ${label} ops pending`);
-        await sleep(backoffMs);
+        this.log(`  … ${pending.size}/${total} ${label} ops unconfirmed`);
+        await sleep(Math.min(backoffMs, Math.max(0, deadline - Date.now())));
       }
     }
+    const result = { completed: total - pending.size - failed, failed, pending: pending.size };
     this.log(
-      `[wait] ${label} drained — ${ids.length - pending.size} done, ${failed} failed` +
-        (pending.size ? `, ${pending.size} still pending at timeout` : "")
+      `[wait] ${label}: ${result.completed} completed, ${failed} failed/cancelled, ${result.pending} unconfirmed`
     );
+    return result;
   }
 
   /**

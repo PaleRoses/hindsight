@@ -178,21 +178,28 @@ describe("HindsightClient.drain", () => {
     await p;
   });
 
-  it("marks non-completed terminal ops as failed and drops them from polling", async () => {
+  it("counts unique terminal outcomes and leaves unconfirmed operations pending at the deadline", async () => {
+    vi.useFakeTimers();
+    const statuses: Record<string, string> = {
+      ok: "completed",
+      bad: "failed",
+      cancelled: "cancelled",
+      busy: "processing",
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        const id = url.split("/").pop()!;
+        return id === "unknown"
+          ? jsonResponse(503, {})
+          : jsonResponse(200, { status: statuses[id] });
+      })
+    );
     const client = new HindsightClient({ apiUrl: "http://x", bank: "b" });
-    const fetchMock = vi.fn(async (url: string | URL | Request) => {
-      const id = String(url).split("/").pop();
-      return id === "1"
-        ? jsonResponse(200, { status: "failed" })
-        : jsonResponse(200, { status: "completed" });
-    });
-    vi.stubGlobal("fetch", fetchMock);
-    const log = vi.fn();
-    const c = new HindsightClient({ apiUrl: "http://x", bank: "b", log });
-
-    await c.drain(["1", "2"], "test", 10_000);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(log).toHaveBeenCalledWith("[wait] test drained — 2 done, 1 failed");
+    const result = client.drain(["ok", "ok", "bad", "cancelled", "busy", "unknown"], "test", 500);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(await result).toEqual({ completed: 1, failed: 2, pending: 2 });
+    expect(await client.drain([], "test")).toEqual({ completed: 0, failed: 0, pending: 0 });
   });
 });
 
@@ -519,7 +526,30 @@ describe("every client-building entrypoint forwards observationScopes", () => {
   });
 });
 
+it("does not accept an async retain without a trackable operation", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => jsonResponse(200, { success: true }))
+  );
+  const client = new HindsightClient({ apiUrl: "http://x", bank: "b" });
+  await expect(client.retain("fact", "test", "doc", [], "document")).rejects.toThrow();
+});
+
 describe("HindsightClient.activeOperations", () => {
+  it("rejects unavailable or invalid counts instead of reporting a drained bank", async () => {
+    const client = new HindsightClient({ apiUrl: "http://x", bank: "b" });
+    for (const response of [
+      jsonResponse(503, {}),
+      jsonResponse(404, { total: 0 }),
+      jsonResponse(200, { total: "0" }),
+    ]) {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => response)
+      );
+      await expect(client.activeOperations()).rejects.toThrow();
+    }
+  });
   /** The fixture is the adversary: `active_only` applies the server's own predicate, `status`
    *  filters, `total` counts the FILTERED set while only `limit` rows come back, and the 374
    *  in-flight ops sit in whichever non-terminal status a single-status caller did NOT ask about.

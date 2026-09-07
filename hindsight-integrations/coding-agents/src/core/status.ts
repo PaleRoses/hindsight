@@ -1,18 +1,7 @@
 /**
- * Bank sync status — the observable contract that replaced the manual backfill CLI.
- *
- * Ingestion is automatic and background (core/seed.ts spawns the deepen engine at session start),
- * so "is my memory ready?" needs an inspectable answer instead of a command exit code. `syncStatus`
- * compares the LIVE bank against the repo: gitlog seed present, how much of the recent history has
- * been deepened (per-commit diffs), chats ingested, knowledge pages present, extractions still
- * running. Agents get it as the `hindsight_sync_status` tool; harnesses (e.g. the benchmark) poll
- * the same via `dist/status.js`.
- *
- * `synced` is the completion marker for the REQUIRED memory: gitlog seeded, pages created, and no
- * extraction operation still active. The deepen engine creates pages LAST (after draining its
- * enqueued extractions), so `synced` implies the seed's facts are queryable. The per-commit diff
- * trickle deliberately does NOT gate `synced` — it deepens across sessions and is a bonus, not a
- * prerequisite.
+ * Bank readiness, not this run's ingestion result or a page-freshness guarantee.
+ * `synced` requires the gitlog seed, pages, and a known-idle bank. Unknown status is not idle.
+ * Page freshness comes from the knowledge-page API; per-commit deepening is not a prerequisite.
  */
 import { execFileSync } from "node:child_process";
 import { commitsSince, repoNameOf } from "./git";
@@ -40,7 +29,7 @@ export interface SyncStatus {
   surveyBaseline: string | null; // HEAD sha at the last codebase survey START (null = never started)
   surveyDocs: number; // findings documents present (of 4) — completion signal, not just started
   surveyCommitsBehind: number | null; // commits since that baseline (null = no baseline / no repo)
-  activeOps: number | null; // extraction ops still running; null if the server can't report
+  activeOps: number | null; // bank-wide non-terminal operations; null when unavailable
   synced: boolean;
 }
 
@@ -119,6 +108,6 @@ export async function syncStatus(
     synced:
       gitlogPresent &&
       (client.knowledgePagesSupported === false || pages.length > 0) &&
-      (activeOps ?? 0) === 0,
+      activeOps === 0,
   };
 }

@@ -14,8 +14,7 @@
  *   4. progressively DEEPEN: ingest the next batch of not-yet-ingested commits individually with
  *      their full diffs, NEWEST first (recent decisions matter most), up to DIFF_BATCH per run and
  *      DEEPEN_DIFF_TARGET total — full precision arrives across sessions without a big-bang ingest
- *   5. drain this run's extractions, then create the knowledge pages if the bank has none —
- *      pages-last makes `syncStatus().synced` a real completion marker
+ *   5. report this run's extraction outcomes; knowledge pages refresh asynchronously on the server
  *
  * A per-bank lock file makes concurrent session starts a no-op (stale locks expire).
  */
@@ -37,7 +36,6 @@ import { getHarness, HARNESS_NAMES } from "./harness/registry";
 import { diag } from "./core/diag";
 import { buildRetainStamp } from "./core/retain-stamp";
 import { describeError, log as plog, setLogLevel } from "./core/log";
-import { settleForProgress } from "./core/settle";
 
 const DIFF_BATCH = 50; // per-run cap on per-commit diff ingestion (bounded session cost)
 const LOCK_STALE_MS = 30 * 60 * 1000;
@@ -292,30 +290,23 @@ async function main() {
       /* cosmetics — best-effort */
     }
 
-    await client.drain(client.opIds, "extraction");
-
-    // The drain above only covers operations THIS run enqueued; consolidation and page refreshes
-    // run server-side. Waits for progress, never a bank-wide zero — see core/settle.ts for why.
-    await settleForProgress(() => client.activeOperations().catch(() => 0), {
-      log: (m) => log(`[deepen] ${m}`),
-    });
-    // (knowledge pages need no separate pass: configureBank seeds them through the knowledge-base
-    // API every run, matched by name — syncStatus's `synced` stays sound because it also requires
-    // the gitlog seed present AND zero active extraction operations.)
-
+    const extraction = await client.drain(client.opIds, "extraction");
     const failures = chatFails + gitFails;
+    const incomplete = failures > 0 || extraction.failed > 0 || extraction.pending > 0;
+    if (incomplete) process.exitCode = 1;
     diag("deepen", "deepen_done", {
       bank: FINAL_BANK,
       ms: Date.now() - t0,
       newChats: sessions.length,
       failures,
+      extraction,
     });
     log(
-      `\n✅ deepen complete in ${((Date.now() - t0) / 1000).toFixed(1)}s${failures ? ` (${failures} items failed to enqueue)` : ""}.`
+      `Ingestion ${incomplete ? "incomplete" : "complete"} in ${((Date.now() - t0) / 1000).toFixed(1)}s; ${failures} enqueue failures. Knowledge pages refresh asynchronously.`
     );
   } finally {
     try {
-      unlinkSync(LOCK);
+      if (JSON.parse(readFileSync(LOCK, "utf8")).pid === process.pid) unlinkSync(LOCK);
     } catch {
       /* best-effort */
     }
@@ -328,10 +319,5 @@ main().catch((e) => {
     error: describeError(e),
   });
   console.error("deepen failed:", (e as Error).message || e);
-  try {
-    unlinkSync(LOCK);
-  } catch {
-    /* best-effort */
-  }
   process.exit(1);
 });

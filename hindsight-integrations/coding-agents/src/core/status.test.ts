@@ -100,7 +100,7 @@ describe("syncStatus", () => {
     expect(s.synced).toBe(false);
   });
 
-  it("fail-open: an activeOperations rejection yields activeOps null and does NOT block synced", async () => {
+  it("does not report synced when operation status is unavailable", async () => {
     const client = stubClient({
       gitIds: ["gitlog:repo"],
       activeOperations: async () => {
@@ -109,8 +109,7 @@ describe("syncStatus", () => {
     });
     const s = await syncStatus(client, "bank-1");
     expect(s.activeOps).toBeNull();
-    // (activeOps ?? 0) === 0 — an unreportable count doesn't gate completion.
-    expect(s.synced).toBe(true);
+    expect(s.synced).toBe(false);
   });
 
   it("fail-open: a source:chat listDocumentIds rejection yields chatDocs 0, no throw", async () => {

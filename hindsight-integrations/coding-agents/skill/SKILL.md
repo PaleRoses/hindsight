@@ -460,11 +460,10 @@ check this file — a run whose reflects failed is a no-memory run. Seed starts 
 
 ### Is the memory ready yet?
 
-`hindsight_sync_status` — the agent-facing tool, `dist/status.js` for scripts — answers exactly
-that: `"synced": true` means the seeded memory is queryable. It also reports gitlog freshness, how
-far per-commit deepening has got, the codebase survey's state (`surveyBaseline` is the HEAD the last
-survey started from, `surveyDocs` counts the findings documents that have landed, 0–4 — a baseline
-with no findings retries automatically), and the extraction operations still in flight.
+`hindsight_sync_status` (`dist/status.js` for scripts) reports `synced: true` when the gitlog seed
+and pages exist and the bank has no active operations. It does not certify extraction success or
+page freshness. Unavailable operation status is `activeOps: null` and never counts as synced.
+Git deepening and survey progress are reported separately; pages expose their own staleness.
 
 ### Resetting a repo's memory
 

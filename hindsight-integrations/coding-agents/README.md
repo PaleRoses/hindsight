@@ -721,12 +721,10 @@ they stay where they were built, and new work accrues under the new setting.
 
 ## Ingestion internals (no CLI)
 
-There is no user-facing ingest command — the deepen engine (`dist/deepen.js`) is spawned by every
-session start and does only the missing work: bank configuration, conversation import (dedup by
-document id), the one-time gitlog seed, the next per-commit diff batch (newest first, bounded per
-run), then knowledge pages once extraction has drained. Harnesses that need deterministic ingestion
-(benchmarks, e2e suites) run the same engine directly and poll `dist/status.js` until
-`"synced": true` — the exact readiness contract the `hindsight_sync_status` agent tool reports.
+The background deepen engine (`dist/deepen.js`) configures the bank and pages, imports missing
+conversations, and ingests git history. It waits only for this run's extraction operations, then
+releases its lock; consolidation and page refreshes continue asynchronously. Exit status is nonzero
+if enqueueing failed or any extraction failed, was cancelled, or remains unconfirmed at the deadline.
 
 Past-conversation import accepts a normalized interchange file (engine `--conversations` flag):
 `[{ "id": "s1", "turns": [{ "role": "user", "text": "...", "timestamp?": "ISO" }, ...] }, ...]`,
@@ -792,11 +790,10 @@ check this file — a run whose reflects failed is a no-memory run. Seed starts 
 
 ### Is the memory ready yet?
 
-`hindsight_sync_status` — the agent-facing tool, `dist/status.js` for scripts — answers exactly
-that: `"synced": true` means the seeded memory is queryable. It also reports gitlog freshness, how
-far per-commit deepening has got, the codebase survey's state (`surveyBaseline` is the HEAD the last
-survey started from, `surveyDocs` counts the findings documents that have landed, 0–4 — a baseline
-with no findings retries automatically), and the extraction operations still in flight.
+`hindsight_sync_status` (`dist/status.js` for scripts) reports `synced: true` when the gitlog seed
+and pages exist and the bank has no active operations. It does not certify extraction success or
+page freshness. Unavailable operation status is `activeOps: null` and never counts as synced.
+Git deepening and survey progress are reported separately; pages expose their own staleness.
 
 ### Resetting a repo's memory
 
