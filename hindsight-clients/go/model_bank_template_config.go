@@ -44,6 +44,7 @@ type BankTemplateConfig struct {
 	ConsolidationLlmBatchSize NullableInt32 `json:"consolidation_llm_batch_size,omitempty"`
 	ConsolidationSourceFactsMaxTokens NullableInt32 `json:"consolidation_source_facts_max_tokens,omitempty"`
 	ConsolidationSourceFactsMaxTokensPerObservation NullableInt32 `json:"consolidation_source_facts_max_tokens_per_observation,omitempty"`
+	ConsolidationProtectedVocabularies []map[string]interface{} `json:"consolidation_protected_vocabularies,omitempty"`
 	MaxObservationsPerScope NullableInt32 `json:"max_observations_per_scope,omitempty"`
 	ObservationScopeLimits []map[string]interface{} `json:"observation_scope_limits,omitempty"`
 	ReflectSourceFactsMaxTokens NullableInt32 `json:"reflect_source_facts_max_tokens,omitempty"`
@@ -1109,6 +1110,39 @@ func (o *BankTemplateConfig) UnsetConsolidationSourceFactsMaxTokensPerObservatio
 	o.ConsolidationSourceFactsMaxTokensPerObservation.Unset()
 }
 
+// GetConsolidationProtectedVocabularies returns the ConsolidationProtectedVocabularies field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *BankTemplateConfig) GetConsolidationProtectedVocabularies() []map[string]interface{} {
+	if o == nil {
+		var ret []map[string]interface{}
+		return ret
+	}
+	return o.ConsolidationProtectedVocabularies
+}
+
+// GetConsolidationProtectedVocabulariesOk returns a tuple with the ConsolidationProtectedVocabularies field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *BankTemplateConfig) GetConsolidationProtectedVocabulariesOk() ([]map[string]interface{}, bool) {
+	if o == nil || IsNil(o.ConsolidationProtectedVocabularies) {
+		return nil, false
+	}
+	return o.ConsolidationProtectedVocabularies, true
+}
+
+// HasConsolidationProtectedVocabularies returns a boolean if a field has been set.
+func (o *BankTemplateConfig) HasConsolidationProtectedVocabularies() bool {
+	if o != nil && !IsNil(o.ConsolidationProtectedVocabularies) {
+		return true
+	}
+
+	return false
+}
+
+// SetConsolidationProtectedVocabularies gets a reference to the given []map[string]interface{} and assigns it to the ConsolidationProtectedVocabularies field.
+func (o *BankTemplateConfig) SetConsolidationProtectedVocabularies(v []map[string]interface{}) {
+	o.ConsolidationProtectedVocabularies = v
+}
+
 // GetMaxObservationsPerScope returns the MaxObservationsPerScope field value if set, zero value otherwise (both if not set or set to explicit null).
 func (o *BankTemplateConfig) GetMaxObservationsPerScope() int32 {
 	if o == nil || IsNil(o.MaxObservationsPerScope.Get()) {
@@ -2132,6 +2166,9 @@ func (o BankTemplateConfig) ToMap() (map[string]interface{}, error) {
 	}
 	if o.ConsolidationSourceFactsMaxTokensPerObservation.IsSet() {
 		toSerialize["consolidation_source_facts_max_tokens_per_observation"] = o.ConsolidationSourceFactsMaxTokensPerObservation.Get()
+	}
+	if o.ConsolidationProtectedVocabularies != nil {
+		toSerialize["consolidation_protected_vocabularies"] = o.ConsolidationProtectedVocabularies
 	}
 	if o.MaxObservationsPerScope.IsSet() {
 		toSerialize["max_observations_per_scope"] = o.MaxObservationsPerScope.Get()

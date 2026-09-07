@@ -298,3 +298,4 @@ async def test_guard_spends_the_attempt_budget_at_the_outer_boundary() -> None:
     # instead of being retried invisibly inside a single accounted call.
     assert result.failed is False
     assert (llm.call.await_count, perf.llm_calls) == (2, 2)
+    assert perf.llm_batch_failures == 1

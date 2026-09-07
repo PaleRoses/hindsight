@@ -341,6 +341,23 @@
           "description": "Max tokens of source facts per observation",
           "title": "Consolidation Source Facts Max Tokens Per Observation"
         },
+        "consolidation_protected_vocabularies": {
+          "anyOf": [
+            {
+              "items": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Closed vocabularies whose terms are mutually exclusive during consolidation: [{\"name\": \"environment\", \"terms\": [\"staging\", \"production\"]}]",
+          "title": "Consolidation Protected Vocabularies"
+        },
         "max_observations_per_scope": {
           "anyOf": [
             {
