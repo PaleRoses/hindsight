@@ -79,8 +79,9 @@ export function buildKnowledgePreamble(pages: PageRef[], opts?: ToolGuideOpts): 
     "memory behind them). The tools below are registered, but you must actually CALL them at the right moments:\n" +
     `${toolGuide(opts)}\n` +
     "ALSO your correction tool: when you verify a Hindsight memory is wrong or stale, ingest a " +
-    '"Correction: <topic>" doc stating what memory claimed, what is true now, and the evidence — ' +
-    "newer facts supersede older ones.\n" +
+    '"Correction: <topic>" doc stating what memory claimed, what is true now, and the evidence. ' +
+    "Ingesting it does not rewrite the page or guarantee that it outranks the old claim, " +
+    "so state the correction in your answer too.\n" +
     `${body}\n` +
     "This tool guide and the page list are re-injected for you periodically as things change.\n" +
     "</hindsight_knowledge>"

@@ -55,6 +55,8 @@ source contradicts it), FIX THE RECORD — don't just ignore it. Call
 - **content**: (1) what memory claimed, (2) what is verifiably true now, (3) the evidence you
   checked (file/commit/output). Quote exact values verbatim.
 
-Newer facts supersede older ones in retrieval, so one clear correction permanently outranks the
-stale memory. Do this whenever you catch a wrong injected memory, a stale knowledge-page claim, or
-an outdated decision — silent disregard leaves the trap armed for the next session.
+Ingesting a correction adds evidence for future retrieval and page refreshes; it does not rewrite
+the page or guarantee that the correction outranks the old claim. The old claim can remain
+retrievable, so state the verified correction in your answer as well. Do this whenever you catch a
+wrong injected memory, a stale knowledge-page claim, or an outdated decision — silent disregard
+leaves the trap armed for the next session.
