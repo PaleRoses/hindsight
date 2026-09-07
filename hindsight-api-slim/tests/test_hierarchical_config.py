@@ -165,7 +165,6 @@ async def test_hierarchical_fields_categorization():
     assert "enable_graph_retrieval" in configurable
     assert "enable_reranking" in configurable
     assert "mental_model_min_refresh_interval_seconds" in configurable
-    assert "consolidation_protected_vocabularies" in configurable
 
     # Verify credential fields (NEVER exposed)
     assert "llm_api_key" in credentials

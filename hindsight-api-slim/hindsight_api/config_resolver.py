@@ -555,18 +555,13 @@ class ConfigResolver:
             except Exception as e:
                 raise ValueError(f"Invalid entity_labels format: {e}")
 
-        if (
-            "consolidation_protected_vocabularies" in normalized_updates
-            and normalized_updates["consolidation_protected_vocabularies"] is not None
-        ):
-            try:
-                vocabularies = parse_consolidation_protected_vocabularies(
+        # Persist the canonical form, so the stored JSON is exactly what resolution parses back.
+        if normalized_updates.get("consolidation_protected_vocabularies") is not None:
+            normalized_updates["consolidation_protected_vocabularies"] = [
+                {"name": vocabulary.name, "terms": list(vocabulary.terms)}
+                for vocabulary in parse_consolidation_protected_vocabularies(
                     normalized_updates["consolidation_protected_vocabularies"]
                 )
-            except ValueError as e:
-                raise ValueError(f"Invalid consolidation_protected_vocabularies format: {e}") from e
-            normalized_updates["consolidation_protected_vocabularies"] = [
-                {"name": vocabulary.name, "terms": list(vocabulary.terms)} for vocabulary in vocabularies
             ]
 
         # Validate retain_strategies: reject empty string keys

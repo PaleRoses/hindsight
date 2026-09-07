@@ -1,41 +1,18 @@
 /**
- * Waiting out server-side follow-on work (consolidation, page refreshes) after a run's own
- * operations have drained.
- *
- * The naive version of this waits for the bank's active-operation count to reach ZERO. On a real
- * bank it never does: a retry backlog can be deliberately parked with `next_retry_at` far in the
- * future, and concurrent sessions enqueue work of their own. The count therefore has a floor this
- * run cannot lower, the wait burns its entire deadline every time, and — because the caller holds
- * a per-bank lock while it waits — every session starting inside that window is locked out of
- * ingesting anything at all.
- *
- * So wait for PROGRESS instead. Keep polling while the backlog is still shrinking; once it has
- * stopped shrinking, what remains is somebody else's and no amount of waiting will clear it.
+ * Wait out the server-side follow-on work (consolidation, page refreshes) a run's own drain does
+ * not cover. A bank-wide ZERO is the wrong target: retries parked with a far-future `next_retry_at`
+ * and other sessions' work floor the count, so waiting for zero burns the whole deadline while the
+ * caller holds the per-bank lock, locking every session started in that window out of ingesting.
+ * Wait for PROGRESS: once the backlog stops shrinking, the rest is somebody else's.
  */
+export type SettleOutcome = "drained" | "stalled" | "timeout";
 
-/** Why the wait ended. Reported so a caller can log the difference rather than guess at it. */
-export type SettleOutcome =
-  /** The bank reached zero active operations — everything, everywhere, drained. */
-  | "drained"
-  /** The count stopped falling: what is left is not this run's work. The common outcome. */
-  | "stalled"
-  /** Still shrinking when the hard deadline expired. */
-  | "timeout";
-
-export interface SettleResult {
-  outcome: SettleOutcome;
-  /** Active count at the moment the wait ended (0 when drained). */
-  active: number;
-  /** Polls performed. Zero means the bank was already clear. */
-  polls: number;
-}
+export type SettleResult = { outcome: SettleOutcome; active: number; polls: number };
 
 export interface SettleOptions {
-  /** Delay between polls. */
   pollMs?: number;
-  /** Consecutive polls without a new low-water mark before declaring the backlog stalled. */
+  /** Consecutive polls without a NEW LOW-WATER mark before the backlog counts as stalled. */
   stallPolls?: number;
-  /** Hard ceiling on the whole wait, whatever progress is being made. */
   maxMs?: number;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -50,13 +27,10 @@ export async function settleForProgress(
   activeOperations: () => Promise<number>,
   opts: SettleOptions = {}
 ): Promise<SettleResult> {
-  const pollMs = opts.pollMs ?? SETTLE_POLL_MS;
-  const stallPolls = opts.stallPolls ?? SETTLE_STALL_POLLS;
-  const maxMs = opts.maxMs ?? SETTLE_MAX_MS;
-  const now = opts.now ?? (() => Date.now());
-  const sleep = opts.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
-  const log = opts.log ?? (() => {});
-
+  const { pollMs = SETTLE_POLL_MS, stallPolls = SETTLE_STALL_POLLS, maxMs = SETTLE_MAX_MS } = opts;
+  const { now = Date.now, log = () => {} } = opts;
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const stallWindow = (stallPolls * pollMs) / 1000;
   const deadline = now() + maxMs;
   let lowWater = Infinity;
   let stalled = 0;
@@ -67,15 +41,13 @@ export async function settleForProgress(
     polls++;
     if (active === 0) return { outcome: "drained", active: 0, polls };
 
-    // Low-water mark, not the previous reading: the count RISES as new work arrives, and a rise
-    // is not progress on the backlog being waited out.
+    // Low-water mark, not the previous reading: the count RISES as new work arrives, and a dip
+    // below the last reading that is still above the floor is not progress on this run's backlog.
     if (active < lowWater) {
       lowWater = active;
       stalled = 0;
     } else if (++stalled >= stallPolls) {
-      log(
-        `${active} op(s) active, none cleared in ${(stallPolls * pollMs) / 1000}s — not this run's, proceeding`
-      );
+      log(`${active} op(s) active, none cleared in ${stallWindow}s — not this run's, proceeding`);
       return { outcome: "stalled", active, polls };
     }
 
@@ -83,7 +55,6 @@ export async function settleForProgress(
       log(`${active} server-side op(s) still active at settle timeout — proceeding`);
       return { outcome: "timeout", active, polls };
     }
-
     log(`waiting for ${active} server-side op(s) to settle …`);
     await sleep(pollMs);
   }

@@ -1495,41 +1495,34 @@ class ConsolidationProtectedVocabulary:
     terms: tuple[str, ...]
 
 
-def parse_consolidation_protected_vocabularies(
-    value: Any,
-) -> tuple[ConsolidationProtectedVocabulary, ...]:
+def parse_consolidation_protected_vocabularies(value: Any) -> tuple[ConsolidationProtectedVocabulary, ...]:
     """Validate and canonicalize protected consolidation vocabularies."""
     if value is None:
         return ()
     if not isinstance(value, (list, tuple)):
         raise ValueError("consolidation_protected_vocabularies must be a list")
 
-    def parse_vocabulary(raw: Any, index: int) -> ConsolidationProtectedVocabulary:
+    vocabularies: list[ConsolidationProtectedVocabulary] = []
+    seen_names: set[str] = set()
+    for index, raw in enumerate(value):
         if isinstance(raw, ConsolidationProtectedVocabulary):
             raw = {"name": raw.name, "terms": raw.terms}
         if not isinstance(raw, dict) or set(raw) != {"name", "terms"}:
             raise ValueError(f"consolidation_protected_vocabularies[{index}] must contain exactly 'name' and 'terms'")
-        name = raw["name"]
-        terms = raw["terms"]
+        name, terms = raw["name"], raw["terms"]
         if not isinstance(name, str) or not name.strip():
             raise ValueError(f"consolidation_protected_vocabularies[{index}].name must be a non-empty string")
-        canonical_name = " ".join(unicodedata.normalize("NFKC", name).split())
-        if not isinstance(terms, (list, tuple)):
-            raise ValueError(f"consolidation_protected_vocabularies[{index}].terms must be a list")
-        if not all(isinstance(term, str) and term.strip() for term in terms):
-            raise ValueError(f"consolidation_protected_vocabularies[{index}].terms must contain only non-empty strings")
+        if not isinstance(terms, (list, tuple)) or not all(isinstance(term, str) and term.strip() for term in terms):
+            raise ValueError(f"consolidation_protected_vocabularies[{index}].terms must be a list of non-empty strings")
         canonical_terms = tuple(" ".join(unicodedata.normalize("NFKC", term).split()).casefold() for term in terms)
-        if len(canonical_terms) < 2:
-            raise ValueError(f"consolidation_protected_vocabularies[{index}] must define at least two terms")
-        if len(set(canonical_terms)) != len(canonical_terms):
-            raise ValueError(f"consolidation_protected_vocabularies[{index}].terms contains duplicates")
-        return ConsolidationProtectedVocabulary(name=canonical_name, terms=canonical_terms)
-
-    vocabularies = tuple(parse_vocabulary(raw, index) for index, raw in enumerate(value))
-    names = tuple(vocabulary.name.casefold() for vocabulary in vocabularies)
-    if len(set(names)) != len(names):
-        raise ValueError("consolidation_protected_vocabularies contains duplicate vocabulary names")
-    return vocabularies
+        if len(canonical_terms) < 2 or len(set(canonical_terms)) != len(canonical_terms):
+            raise ValueError(f"consolidation_protected_vocabularies[{index}] needs two or more distinct terms")
+        canonical_name = " ".join(unicodedata.normalize("NFKC", name).split())
+        if (folded_name := canonical_name.casefold()) in seen_names:
+            raise ValueError(f"consolidation_protected_vocabularies[{index}].name duplicates an earlier vocabulary")
+        seen_names.add(folded_name)
+        vocabularies.append(ConsolidationProtectedVocabulary(name=canonical_name, terms=canonical_terms))
+    return tuple(vocabularies)
 
 
 # Observations defaults (consolidated knowledge from facts)
@@ -1574,7 +1567,6 @@ DEFAULT_CONSOLIDATION_MAX_TOKENS = 512  # Max tokens for recall when finding rel
 # budget — 100% backwards compatible. Operators on providers with a low hidden default (notably Bedrock imported
 # models, which cap at 4096 and truncate structured consolidation JSON) set this explicitly to fix #1939.
 DEFAULT_CONSOLIDATION_MAX_COMPLETION_TOKENS = None
-DEFAULT_CONSOLIDATION_PROTECTED_VOCABULARIES: tuple[ConsolidationProtectedVocabulary, ...] = ()
 DEFAULT_CONSOLIDATION_RECALL_BUDGET = "low"  # Budget level for consolidation recall (low/mid/high)
 DEFAULT_CONSOLIDATION_SOURCE_FACTS_MAX_TOKENS = (
     4096  # Total token budget for source facts in consolidation recall (-1 = unlimited)

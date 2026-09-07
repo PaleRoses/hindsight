@@ -285,10 +285,8 @@ async function main() {
 
     await client.drain(client.opIds, "extraction");
 
-    // The drain above only covers operations THIS run enqueued — consolidation and the template's
-    // page refreshes run server-side on their own schedule, so give them a moment to land. This
-    // waits for PROGRESS, never for a bank-wide zero: see core/settle.ts for why zero is the wrong
-    // target, and why waiting for it here locks the next session out of ingesting anything.
+    // The drain above only covers operations THIS run enqueued; consolidation and page refreshes
+    // run server-side. Waits for progress, never a bank-wide zero — see core/settle.ts for why.
     await settleForProgress(() => client.activeOperations().catch(() => 0), {
       log: (m) => log(`[deepen] ${m}`),
     });

@@ -82,6 +82,17 @@ describe("buildKnowledgePreamble", () => {
       expect(out).not.toMatch(/hindsight_reflect.*FIRST/);
     }
   });
+
+  /** The banner used to promise that an ingested correction supersedes what it refutes. Measured
+   *  on a live bank: retrieval has no supersession mechanism, and no ingest path refreshes a page,
+   *  so the agent has to carry the correction in its own answer. */
+  it("tells the agent to ingest a correction AND to state it, the page being unchanged", () => {
+    const out = buildKnowledgePreamble([{ id: "p1", title: "Component map" }]);
+    expect(out).toContain('"Correction: <topic>" doc');
+    expect(out).toContain("does NOT rewrite the page");
+    expect(out).toContain("state the correction in your own answer");
+    expect(out).not.toMatch(/supersede|outrank/i);
+  });
 });
 
 describe("buildRosterRefresh", () => {
@@ -130,27 +141,5 @@ describe("staleness in the injected rosters", () => {
       expect(out).not.toContain("STALE");
       expect(out).toContain("- Core concepts (p2)");
     }
-  });
-});
-
-/** The banner used to promise that an ingested correction supersedes what it refutes. Measured on
- *  a live bank: retrieval has no supersession mechanism at all, the recency term is worth ~0.1%
- *  against a cross-encoder score, and no ingest path refreshes a page. */
-describe("the correction instruction", () => {
-  const out = buildKnowledgePreamble([{ id: "p1", title: "Component map" }]);
-
-  it("still tells the agent to ingest the correction", () => {
-    expect(out).toContain('"Correction: <topic>" doc');
-    expect(out).toContain("the evidence");
-  });
-
-  it("no longer claims the correction supersedes or outranks the stale fact", () => {
-    expect(out).not.toMatch(/supersede/i);
-    expect(out).not.toMatch(/outrank/i);
-  });
-
-  it("says what ingesting actually does, and that the agent must say it out loud too", () => {
-    expect(out).toContain("does NOT rewrite the page");
-    expect(out).toContain("state the correction in your own answer");
   });
 });

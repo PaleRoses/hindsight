@@ -97,9 +97,7 @@ export function buildKnowledgePreamble(pages: PageRef[], opts?: ToolGuideOpts): 
     `${toolGuide(opts)}\n` +
     "ALSO your correction tool: when you verify a Hindsight memory is wrong or stale, ingest a " +
     '"Correction: <topic>" doc stating what memory claimed, what is true now, and the evidence. ' +
-    "That records the correction; it does NOT rewrite the page, and the claim it refutes stays " +
-    "retrievable until the page is next rebuilt — so state the correction in your own answer too, " +
-    "rather than assuming a later session will find it.\n" +
+    "That does NOT rewrite the page, so state the correction in your own answer too.\n" +
     `${body}\n` +
     "This tool guide and the page list are re-injected for you periodically as things change.\n" +
     "</hindsight_knowledge>"

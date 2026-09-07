@@ -207,28 +207,20 @@ pub fn create_page(
     }
 }
 
-/// The page body: everything after the closing fence of a *leading, complete*
-/// frontmatter block, minus the single blank line the renderer writes as their
-/// separator and any trailing whitespace.
-///
-/// A page arrives as one document — frontmatter, then the synthesized body —
-/// and the pretty view prints every frontmatter field from its own response
-/// field, so reprinting the block would duplicate the header. A document with
-/// no leading block is markdown in its own right and is returned whole, and a
-/// body that opens on a thematic break (`---`) keeps it.
+/// The body of a page document: everything after a *leading, complete* frontmatter
+/// block and the single blank line separating it from the body. The pretty view
+/// prints every frontmatter field from its own response field, so reprinting the
+/// block would duplicate the header; a document with no leading fence, or no
+/// closing one, is markdown in its own right and comes back whole, and a body
+/// opening on a thematic break (`---`) keeps it.
 fn document_body(markdown: &str) -> &str {
-    let Some(after_open) = markdown.strip_prefix("---\n") else {
+    if !markdown.starts_with("---\n") {
+        return markdown.trim_end();
+    }
+    let Some((_, body)) = markdown.split_once("\n---\n") else {
         return markdown.trim_end();
     };
-    let mut offset = 0;
-    for line in after_open.split_inclusive('\n') {
-        offset += line.len();
-        if line.trim_end_matches(['\r', '\n']) == "---" {
-            let body = &after_open[offset..];
-            return body.strip_prefix('\n').unwrap_or(body).trim_end();
-        }
-    }
-    markdown.trim_end()
+    body.strip_prefix('\n').unwrap_or(body).trim_end()
 }
 
 /// Read a page as a markdown document
@@ -568,32 +560,21 @@ mod tests {
 
     #[test]
     fn document_body_drops_a_leading_frontmatter_block() {
-        let doc = "---\nid: kp-1\ntype: runbook\n---\n\n# Deploy\n\nStep one.\n";
-        assert_eq!(document_body(doc), "# Deploy\n\nStep one.");
+        // The block and the one blank line after it, and nothing else: the body's
+        // indentation survives, and a body opening on a thematic break keeps it.
+        for (doc, body) in [
+            ("---\nid: kp-1\n---\n\n- p\n  - c\n", "- p\n  - c"),
+            ("---\nid: kp-1\n---\n\n---\n\n# Deploy\n", "---\n\n# Deploy"),
+            ("---\nid: kp-1\n---\n", ""),
+        ] {
+            assert_eq!(document_body(doc), body, "document_body({doc:?})");
+        }
     }
 
     #[test]
-    fn document_body_keeps_a_body_opening_on_a_thematic_break() {
-        let doc = "---\nid: kp-1\n---\n\n---\n\n# Deploy\n";
-        assert_eq!(document_body(doc), "---\n\n# Deploy");
-    }
-
-    #[test]
-    fn document_body_is_empty_for_a_page_with_no_content() {
-        assert_eq!(document_body("---\nid: kp-1\n---\n"), "");
-    }
-
-    #[test]
-    fn document_body_returns_plain_markdown_untouched() {
-        assert_eq!(
-            document_body("# Deploy\n\nStep one.\n"),
-            "# Deploy\n\nStep one."
-        );
-    }
-
-    #[test]
-    fn document_body_returns_the_whole_document_when_the_fence_never_closes() {
-        let doc = "---\nid: kp-1\ntype: runbook\n";
-        assert_eq!(document_body(doc), doc.trim_end());
+    fn document_body_returns_a_document_without_a_complete_block_whole() {
+        for doc in ["# Deploy\n\n---\n\nStep one.\n", "---\nid: kp-1\n"] {
+            assert_eq!(document_body(doc), doc.trim_end(), "document_body({doc:?})");
+        }
     }
 }
