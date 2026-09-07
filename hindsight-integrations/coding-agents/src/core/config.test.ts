@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadConfig, applyBankConfig, readEnvConfig, resolveConfig } from "./config";
+import { deriveBankId } from "./bank";
 
 let root: string;
 let globalCfg: string;
@@ -434,18 +435,16 @@ describe("principals registry", () => {
   });
 
   it("registers owners against arbitrary bank ids, trimmed, and trims the selector", () => {
-    const cfg = resolveConfig({
-      principals: {
-        alpha: { bankId: "  Alpha::Personal Memory  " },
-        worker: { bankId: "archive" },
-      },
-      principal: " alpha ",
-    });
-    expect(cfg.principals).toEqual({
-      ok: true,
-      entries: { alpha: { bankId: "Alpha::Personal Memory" }, worker: { bankId: "archive" } },
-    });
+    // What a consumer sees of a registry is the bank it routes to, so assert THAT: an untrimmed
+    // bank id names a different bank on the wire, and an untrimmed selector names no owner at all.
+    const principals = {
+      alpha: { bankId: "  Alpha::Personal Memory  " },
+      worker: { bankId: "archive" },
+    };
+    const cfg = resolveConfig({ principals, principal: " alpha " });
     expect(cfg.principal).toBe("alpha");
+    expect(deriveBankId(cfg, root)).toBe("Alpha::Personal Memory");
+    expect(deriveBankId(resolveConfig({ principals, principal: "worker" }), root)).toBe("archive");
   });
 
   it("takes an id up to 64 chars and refuses anything outside the id grammar", () => {
@@ -519,7 +518,8 @@ describe("principals — the registry is the file's, the selector is the harness
     });
     const cfg = loadConfig({ path: globalCfg, harness: "claude-code" });
     expect(cfg.principal).toBe("alpha");
-    expect(cfg.principals).toEqual({ ok: true, entries: { alpha: { bankId: "Alpha::Personal" } } });
+    // The registry the harness section tried to install would have routed alpha to somewhere-else.
+    expect(deriveBankId(cfg, root)).toBe("Alpha::Personal");
   });
 
   it("a banks.<id> section cannot re-point the owner, and refuses to rename its bank", () => {
@@ -542,7 +542,40 @@ describe("principals — the registry is the file's, the selector is the harness
     const out = applyBankConfig(cfg, "Alpha::Personal");
     expect(out.bankId).toBe("Alpha::Personal");
     expect(out.cfg.principal).toBe("alpha");
-    expect(out.cfg.principals).toEqual(cfg.principals);
+    expect(deriveBankId(out.cfg, root)).toBe("Alpha::Personal");
     expect(out.cfg.retainSessions).toBe(false); // behavioural fields still apply
+  });
+});
+
+/**
+ * `shareTo` is a DIRECTED edge between owners: whose bank this owner may write a statement INTO,
+ * and nothing else. It is part of the registry, so an untrustworthy graph invalidates the registry
+ * rather than being pruned — a pruned edge reads as "never shared", a pruned target as "shared
+ * with somebody else's bank".
+ */
+describe("principals — directed sharing edges", () => {
+  const graph = (shareTo: unknown) =>
+    resolveConfig({
+      principals: {
+        alpha: { bankId: "alpha-bank", shareTo },
+        beta: { bankId: "beta-bank" },
+      } as never,
+      principal: "alpha",
+    }).principals;
+
+  it("keeps one edge per named owner, whitespace and repetition aside", () => {
+    const registry = graph([" beta ", "beta"]);
+    expect(registry.ok && registry.entries.alpha.shareTo).toEqual(["beta"]);
+  });
+
+  it("refuses an edge that does not name another registered owner", () => {
+    // A self-edge would write the owner's own memory back as a share; a dangling target names a
+    // bank no owner holds, so there is no owner whose policy and credential could carry the write.
+    expect(graph(["alpha"]).ok).toBe(false);
+    expect(graph(["ghost"]).ok).toBe(false);
+  });
+
+  it("refuses a sharing list that is not a list of owner ids", () => {
+    for (const shareTo of ["beta", 7, [7], [null], {}]) expect(graph(shareTo).ok).toBe(false);
   });
 });

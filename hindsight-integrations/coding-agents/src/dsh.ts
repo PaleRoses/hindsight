@@ -23,6 +23,7 @@
  * and no version to keep in step — any dsh whose event names still match can load this file.
  */
 import { randomUUID } from "node:crypto";
+import { z } from "zod";
 import { resolveHostMemory } from "./core/host-client";
 import { diag } from "./core/diag";
 import type { ToolSpec } from "./core/knowledge-tools";
@@ -304,34 +305,17 @@ export function createDshHooks(resolve: (agent: DshAgent) => Workspace | undefin
  * Building the schema here therefore keeps the plugin free of a `@deepseek-ai/dsh-tools` dependency
  * that pnpm would have to resolve inside the profile, at the cost of one small projection.
  *
- * Our specs state their input as a Zod raw shape (the MCP dialect every harness shares) and are
- * deliberately flat: required or optional strings. Optionality and the description are the only two
- * facts to carry across; a parameter that is ever anything but a string fails loudly here rather
- * than registering a mis-typed tool.
+ * Use Zod's JSON Schema conversion (also used by the Pi adapter), preserving constraints such
+ * as recipient enums and nonempty statements. The host contract remains flat string parameters.
  */
 export function toDshParameters(spec: ToolSpec): Record<string, unknown> {
-  const properties: Record<string, unknown> = {};
-  const required: string[] = [];
-  for (const [key, schema] of Object.entries(spec.inputSchema)) {
-    const zod = schema as {
-      def?: { type?: string; innerType?: { def?: { type?: string } } };
-      description?: string;
-      isOptional?: () => boolean;
-    };
-    // `.optional()` wraps the real type, so unwrap before checking it — otherwise every optional
-    // parameter would pass the guard below whatever it actually holds.
-    const inner = zod.def?.type === "optional" ? zod.def.innerType?.def?.type : zod.def?.type;
-    if (inner !== undefined && inner !== "string") {
-      throw new Error(
-        `hindsight tool ${spec.name}: dsh projection supports string parameters only`
-      );
-    }
-    properties[key] = {
-      type: "string",
-      ...(zod.description ? { description: zod.description } : {}),
-    };
-    if (typeof zod.isOptional !== "function" || !zod.isOptional()) required.push(key);
-  }
+  const { properties = {}, required = [] } = z.toJSONSchema(z.object(spec.inputSchema));
+  if (
+    Object.values(properties).some(
+      (property) => typeof property !== "object" || property.type !== "string"
+    )
+  )
+    throw new Error(`hindsight tool ${spec.name}: dsh projection supports string parameters only`);
   return { type: "object", properties, ...(required.length ? { required } : {}) };
 }
 

@@ -33,7 +33,7 @@ import { brandWord } from "./brand";
 import { diag } from "./diag";
 import { setLogLevel } from "./log";
 import { parsePageList, buildKnowledgePreamble, type PageRef } from "./knowledge-injection";
-import type { ClientOpts, RetainOpts } from "./hindsight";
+import type { ClientOpts } from "./hindsight";
 import { buildRetainStamp } from "./retain-stamp";
 import { HindsightClient } from "./hindsight";
 import { sessionCacheFile, sessionRootDir, writeSessionCache } from "./session-cache";
@@ -45,14 +45,7 @@ interface SeedContextClient {
   knowledgePagesSupported?: boolean;
   // Optional: used to write the survey-baseline marker (Option A). HindsightClient has it; the
   // minimal test clients omit it, and the baseline write guards on its presence.
-  retain?(
-    content: string,
-    context: string,
-    documentId: string,
-    tags: string[],
-    strategy: string,
-    opts?: RetainOpts
-  ): Promise<void>;
+  retain?: HindsightClient["retain"];
 }
 
 /**

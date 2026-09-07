@@ -5,6 +5,7 @@ vi.mock("./git-layout", () => ({ probeGitLayout: vi.fn() }));
 
 import { bankProjectName, deriveBankId } from "./bank";
 import { probeGitLayout } from "./git-layout";
+import { resolveConfig } from "./config";
 import { pagesFor } from "./missions";
 
 const mockProbe = vi.mocked(probeGitLayout);
@@ -93,10 +94,7 @@ describe("bankProjectName", () => {
       // An owner's bank collects every repository that identity works in, so the page scope is the
       // BANK. Naming the repo of whichever session ran last is the #4146 rewrite loop.
       const BANK = "Alpha::Personal Memory";
-      const cfg = {
-        principals: { ok: true as const, entries: { alpha: { bankId: BANK } } },
-        principal: "alpha",
-      };
+      const cfg = resolveConfig({ principals: { alpha: { bankId: BANK } }, principal: "alpha" });
 
       mockProbe.mockReturnValue(inRepo("/work/one-repo/.git"));
       expect(deriveBankId(cfg, "/work/one-repo")).toBe(BANK);

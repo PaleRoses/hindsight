@@ -14,6 +14,7 @@
  * No opencode/claude specifics live here — only the memory logic.
  */
 import type { Config } from "./config";
+import { createSharing } from "./host-client";
 import { maybeAutoUpdate } from "./auto-update";
 import { DAEMON_WAIT_RETAIN_MS, DAEMON_WAIT_SESSION_START_MS, ensureDaemon } from "./daemon";
 import { diag } from "./diag";
@@ -80,6 +81,7 @@ export class RuntimeCore {
       repoDir: this.projectDir,
       harness: this.harness,
       principal: this.cfg.principal,
+      share: createSharing(this.harness, this.projectDir, { cfg: this.cfg, bankId: this.bankId }),
       pageTrigger: buildPageTrigger(this.cfg),
       reflectTimeoutMs: this.cfg.reflectToolTimeoutMs,
       reflectBudget: this.cfg.reflectBudget,

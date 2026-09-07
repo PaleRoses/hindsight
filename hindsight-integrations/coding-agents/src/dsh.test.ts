@@ -243,6 +243,26 @@ describe("toDshParameters", () => {
     });
   });
 
+  it("preserves finite recipient choices and nonempty statement requirements", () => {
+    expect(
+      toDshParameters(
+        spec({
+          recipient: z.enum(["alpha", "beta"]),
+          content: z.string().min(1),
+          context: z.string().optional(),
+        })
+      )
+    ).toEqual({
+      type: "object",
+      properties: {
+        recipient: { type: "string", enum: ["alpha", "beta"] },
+        content: { type: "string", minLength: 1 },
+        context: { type: "string" },
+      },
+      required: ["recipient", "content"],
+    });
+  });
+
   it("omits `required` for a tool that takes no arguments", () => {
     expect(toDshParameters(spec({}))).toEqual({ type: "object", properties: {} });
   });

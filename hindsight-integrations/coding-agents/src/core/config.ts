@@ -33,6 +33,7 @@ export const DEFAULT_DAEMON_PROFILE = "coding-agent";
 /** A stable memory owner, independent of the client or model acting for it. */
 export interface PrincipalConfig {
   readonly bankId: string;
+  readonly shareTo: readonly string[];
 }
 
 export type PrincipalRegistryResult =
@@ -42,7 +43,7 @@ export type PrincipalRegistryResult =
 /** The config file's shape — every field optional; omitted fields take the documented default. */
 export interface RawConfig {
   /** Stable memory owners; file-only, never replaced by a harness or bank override. */
-  principals?: Record<string, PrincipalConfig>;
+  principals?: Record<string, { bankId: string; shareTo?: readonly string[] }>;
   principal?: string;
   /** Where memory lives. All three modes speak the same HTTP API; they differ only in who runs it:
    *   "cloud"       — Hindsight Cloud (the default `apiUrl`)
@@ -337,7 +338,7 @@ function resolvePrincipals(raw: RawConfig): PrincipalRegistryResult {
     if (
       typeof entry.bankId !== "string" ||
       !entry.bankId.trim() ||
-      Object.keys(entry).some((key) => key !== "bankId")
+      Object.keys(entry).some((key) => key !== "bankId" && key !== "shareTo")
     )
       return invalid("Invalid bank binding for principal: " + id);
     const bankId = entry.bankId.trim();
@@ -345,9 +346,21 @@ function resolvePrincipals(raw: RawConfig): PrincipalRegistryResult {
     const overrides = raw.banks?.[bankId];
     if (overrides?.bank !== undefined && overrides.bank !== bankId)
       return invalid("Cannot redirect principal bank: " + bankId);
+    if (
+      entry.shareTo !== undefined &&
+      (!Array.isArray(entry.shareTo) ||
+        !entry.shareTo.every((target) => typeof target === "string"))
+    )
+      return invalid("Invalid shareTo for principal: " + id);
     banks.add(bankId);
-    entries[id] = { bankId };
+    entries[id] = {
+      bankId,
+      shareTo: [...new Set(((entry.shareTo ?? []) as string[]).map((target) => target.trim()))],
+    };
   }
+  for (const [id, entry] of Object.entries(entries))
+    if (entry.shareTo.some((target) => target === id || !Object.hasOwn(entries, target)))
+      return invalid("Invalid sharing recipient for principal: " + id);
   if (
     raw.principal !== undefined &&
     (typeof raw.principal !== "string" || !Object.hasOwn(entries, raw.principal.trim()))

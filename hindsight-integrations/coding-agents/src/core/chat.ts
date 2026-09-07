@@ -133,10 +133,10 @@ const REQUEST_BUDGET_MS = 15_000;
  * already on its way.
  */
 async function submitWithRetry(
-  send: () => Promise<void>,
+  send: () => Promise<string>,
   isStillNewest: () => boolean,
   retryUntil: number
-): Promise<void> {
+): Promise<string> {
   for (let attempt = 0; ; attempt++) {
     try {
       return await send();

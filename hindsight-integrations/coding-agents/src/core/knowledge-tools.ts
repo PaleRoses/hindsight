@@ -21,6 +21,7 @@ import { join } from "node:path";
 import type { ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import type { ZodRawShape } from "zod";
 import type { HindsightClient } from "./hindsight";
+import type { MemorySharing } from "./host-client";
 import { syncStatus } from "./status";
 import { applyBankConfig, DEFAULT_REFLECT_TOOL_TIMEOUT_MS, loadConfig } from "./config";
 import { describeError } from "./log";
@@ -101,6 +102,7 @@ export function buildKnowledgeTools(
     harness?: string;
     /** The owner captured when this host bound its client, not a live config lookup. */
     principal?: string;
+    share?: MemorySharing;
     stampFor?: () => RetainStamp;
     /** Refresh policy for a page `hindsight_capture_initiative` creates (core/missions.ts). */
     pageTrigger?: PageTrigger;
@@ -112,6 +114,7 @@ export function buildKnowledgeTools(
     reflectBudget?: "low" | "mid" | "high";
   } = {}
 ): ToolSpec[] {
+  const share = opts.share;
   return [
     {
       name: "hindsight_sync_status",
@@ -340,5 +343,33 @@ export function buildKnowledgeTools(
         return { ok: true, doc_id: docId };
       }),
     },
+    ...(share
+      ? [
+          {
+            name: "hindsight_share_memory",
+            description:
+              "Send one self-contained statement to an allowed memory owner, attributed to you. " +
+              "This writes a new recipient-owned document; it does not read their bank or share yours. " +
+              "Queued acknowledges submission, not completed extraction or consolidation.",
+            inputSchema: {
+              recipient: z.enum(share.recipients),
+              content: z.string().min(1),
+              context: z.string().optional(),
+            },
+            annotations: NON_DESTRUCTIVE_WRITE_ANNOTATIONS,
+            handler: guarded(
+              async (args: { recipient: string; content: string; context?: string }) => {
+                const receipt = await share.send(args);
+                return {
+                  status: "queued",
+                  recipient: receipt.recipient,
+                  doc_id: receipt.documentId,
+                  operation_id: receipt.operationId,
+                };
+              }
+            ),
+          },
+        ]
+      : []),
   ];
 }

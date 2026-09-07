@@ -310,7 +310,7 @@ export class HindsightClient {
     tags: string[],
     strategy: string,
     opts: RetainOpts = {}
-  ): Promise<void> {
+  ): Promise<string> {
     const item: Record<string, unknown> = {
       content,
       context,
@@ -332,6 +332,7 @@ export class HindsightClient {
     if (!r.ok || typeof operation_id !== "string" || !operation_id.trim())
       throw new Error("Async retain did not acknowledge an operation");
     this.opIds.push(operation_id);
+    return operation_id;
   }
 
   /**

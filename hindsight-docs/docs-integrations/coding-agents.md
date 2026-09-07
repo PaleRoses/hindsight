@@ -496,7 +496,7 @@ hook by Codex...), so one shared config serves several agents side by side:
 | ----------------------- | ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `apiUrl`                | `https://api.hindsight.vectorize.io` | Hindsight API base URL (set to `http://localhost:8888` for a local server)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `apiToken`              | —                                    | bearer token (Hindsight Cloud). Picked up without restarting the agent: a long-lived host re-reads it after a rejected request, so enabling auth or rotating the key mid-session recovers on the next call                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `principals`            | —                                    | registry of memory **owners**: `{"alpha": {"bankId": "alpha-memory"}}`. File-only and top-level-only — a `harnesses.<name>` copy is ignored with a warning, and a `banks.<id>` section can neither define owners nor redirect one's bank. Ids match `^[a-z][a-z0-9-]{0,63}$`, each `bankId` is non-empty, and two owners may not name the same bank — see Who the memory belongs to                                                                                                                                                                                                                                                  |
+| `principals`            | —                                    | registry of memory **owners**: `{"alpha": {"bankId": "alpha-memory", "shareTo": ["beta"]}}`. File-only and top-level-only — a `harnesses.<name>` copy is ignored with a warning, and a `banks.<id>` section can neither define owners nor redirect one's bank. An entry declares a non-empty `bankId` and, optionally, `shareTo` — the owners it may push a memory to — and no other field. Ids match `^[a-z][a-z0-9-]{0,63}$`, two owners may not name the same bank, and every `shareTo` id must be another registered owner — see Who the memory belongs to and `shareTo`          |
 | `principal`             | —                                    | which registered owner this agent **is**. Selected per harness (`harnesses.<name>.principal`) or once at the top level; `HINDSIGHT_PRINCIPAL` is the env fallback. Set ⇒ that owner's bank, decided before `mapPathToBank`, `bankId` and the dynamic template. A name that no registry entry declares makes memory inert rather than falling back                                                                                                                                                                                                                                                                                                                                            |
 | `bankId`                | —                                    | **explicit static bank**; unset ⇒ per-repo dynamic resolution (below)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `dynamicBankId`         | dynamic iff no `bankId`              | force dynamic (`true`) or static (`false`) resolution                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
@@ -672,22 +672,51 @@ fallback. Multiple harnesses may select one owner and share its bank, retaining 
 applies. Without a selected owner, existing repository routing is unchanged.
 
 `principals` is file-only and top-level. Harness-local registries are ignored with a warning;
-`banks.<id>` cannot replace the registry or selector. IDs match `^[a-z][a-z0-9-]{0,63}$`.
-Each entry contains only a nonempty `bankId`; distinct owners must have distinct banks.
-Invalid registries, unknown selectors, and bank aliases redirecting an owner disable memory
-with a diagnostic, never a fallback bank.
+`banks.<id>` cannot replace the registry or selector. IDs match `^[a-z][a-z0-9-]{0,63}$`. Each
+entry declares a nonempty `bankId` and, optionally, `shareTo` — no other field; distinct owners
+must have distinct banks. Invalid registries, unknown selectors, and bank aliases redirecting an
+owner disable memory with a diagnostic, never a fallback bank.
 
 Separate banks keep recall and consolidation bank-local; they do not authorize callers. This
 registry is client routing, not a sandbox: credentials with access to another bank can still use
 it. Separation prevents ambient mixing of histories, not every cause of poor context quality.
 
-Every document written under an owner is stamped with the `principal:<id>` tag and a `principal`
-metadata key. That namespace is reserved alongside `source:` and `harness:`, so a `retainTags` or
-`retainMetadata` entry can neither set nor forge it and the stamp always names the owner that
-actually wrote the document. `hindsight_diagnose` reports `principal` (the owner this host is bound
-to), `config.principal` (what the file selects now) and `config.principal_matches_binding` (whether
-that configured owner _and_ its bank are the ones in use) — the last is `false` after an edit the
-host has not been restarted into.
+Every owned document carries a reserved `principal:<id>` tag and `principal` metadata naming
+the bank's owner. Explicit shares identify the sender separately. Configured provenance cannot
+replace these fields. `hindsight_diagnose` reports the bound `principal`, the current
+`config.principal`, and `config.principal_matches_binding` (owner and bank), so a later config
+edit cannot disguise which identity the running host actually serves.
+
+### Handing a memory to another owner — `shareTo`
+
+Add a directed permission to send statements; it does not grant read access:
+
+```jsonc
+{
+  "principals": {
+    "alpha": { "bankId": "alpha-memory", "shareTo": ["beta"] },
+    "beta": { "bankId": "beta-memory" },
+  },
+}
+```
+
+An enabled host with outgoing edges exposes
+`hindsight_share_memory(recipient, content, context?)`; otherwise the tool is absent. Each call
+writes one recipient-owned document and returns `status: "queued"`, `recipient`, `doc_id`, and
+`operation_id`. This acknowledges submission, not completed extraction or consolidation.
+`recipient` is an enum of the advertised owners. Self-edges, missing owners, or a malformed
+`shareTo` invalidate the registry; repeated targets are deduplicated.
+
+Every send rechecks permission. Revoked edges, disabled sides, changed owner/bank bindings, and
+different API endpoints refuse before writing. New bindings require restarting the host. The
+write uses the recipient's bank policy and credential, including token rotation—not the sender's
+bank overrides. It never initializes, seeds, or surveys the recipient bank, and never changes
+the sender's bank. No browsing, mirroring, or automatic retraction is provided.
+
+The stored statement names its sender. Reserved metadata records `principal` = recipient,
+`shared_by` = sender, and `shared_with` = recipient; tags carry `principal:`, `shared-by:`, and
+`shared-with:` alongside `source:upload` and the sending harness. These are integration-owned
+attribution fields, not authenticated identities or a server-side access-control policy.
 
 ### Recording where a memory came from
 
@@ -711,9 +740,10 @@ of. Both accept the same placeholders as `bankIdTemplate` — `{gitProject}`, `{
 `{gitProject}` is worktree-aware here too, so every linked worktree of a repo stamps one name.
 `{sessionId}` resolves to `unknown` for documents that do not originate from an agent session.
 
-The plugin's own `source:`, `harness:` and `principal:` tags are reserved: entries in those
+The plugin's own `source:`, `harness:`, `principal:`, `shared-by:` and `shared-with:` tags are
+reserved, as are the `principal`, `shared_by` and `shared_with` metadata keys: entries in those
 namespaces are ignored with a warning, so a document's attribution always names the agent and owner
-that actually wrote it.
+that actually wrote it, and who — if anyone — sent it.
 
 ### One set of beliefs per repo
 

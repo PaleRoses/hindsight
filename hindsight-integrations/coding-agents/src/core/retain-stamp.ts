@@ -26,7 +26,7 @@ import { projectNameOf } from "./bank";
 import { basename } from "node:path";
 
 /** Tag namespaces the plugin owns — see the filter in buildRetainStamp. */
-const RESERVED_TAG_PREFIX = /^(source|harness|principal):/;
+const RESERVED_TAG_PREFIX = /^(source|harness|principal|shared-by|shared-with):/;
 
 export interface RetainStampContext {
   /** Working directory the retain is being written from — the repo, for {project}/{gitProject}. */
@@ -109,13 +109,12 @@ export function buildRetainStamp(cfg: RetainStampConfig, ctx: RetainStampContext
     });
   const metadata: Record<string, string> = {};
   for (const [key, value] of Object.entries(cfg.retainMetadata ?? {})) {
+    if (key === "principal" || key === "shared_by" || key === "shared_with") continue;
     metadata[key] = applyTemplate(value, resolvers, "retainMetadata");
   }
   if (cfg.principal) {
     tags.push(`principal:${cfg.principal}`);
     metadata.principal = cfg.principal;
-  } else {
-    delete metadata.principal;
   }
   return { tags, metadata };
 }

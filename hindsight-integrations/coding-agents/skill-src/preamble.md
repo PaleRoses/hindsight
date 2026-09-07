@@ -15,7 +15,8 @@ explains what happens automatically, which tools you have, and how to configure 
   `↳ memory bank “coding-agent::<repo>”`). Worktrees share the main repo's bank. When the config
   names a memory **owner** (`principal`), that owner's bank is used instead and stays the same in
   every repository — one agent's experience, not one project's. Documents written under an owner
-  carry a `principal:<id>` tag you cannot set yourself.
+  carry a `principal:<id>` tag you cannot set yourself; one another owner pushed here also carries
+  `shared-by:<id>`, so a recalled memory says whether it was written here or sent.
 - **Ingestion builds itself**: on first open, the bank is seeded from recent commit messages and a
   read-only codebase survey; every session start, a background engine tops it up (new commits, new
   conversations) and keeps 5 knowledge pages current. There is NO ingest command to run.
@@ -37,6 +38,12 @@ When the user says "store this in hindsight" / "remember this":
   call `hindsight_capture_initiative` again with `relates_to_page_id` set to that initiative's page
   id, summarising the _current_ intent. Same page, updated plan — never a second page. Trivial
   course-corrections don't count.
+- A **statement another owner should receive** → `hindsight_share_memory(recipient, content, context?)`.
+  Available only with a configured outgoing `shareTo` edge. Send only the intended statement; it
+  becomes a new recipient-owned document with sender attribution, not access to either bank.
+  The response supplies `doc_id` and `operation_id`; `queued` acknowledges submission, not
+  completed extraction. Revoked permissions or changed bindings refuse. There is no mirroring
+  or automatic retraction. Say who received the statement.
 
 ## Retrieving
 

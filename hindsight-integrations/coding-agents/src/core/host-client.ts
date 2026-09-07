@@ -14,6 +14,8 @@
  * `--harness` flags rather than from a workspace, and their process ends long before a credential
  * can rotate under them.
  */
+import { randomUUID } from "node:crypto";
+import { buildRetainStamp } from "./retain-stamp";
 import { applyBankConfig, loadConfig, type Config } from "./config";
 import { deriveBankIdOrSkip } from "./bank";
 import { HindsightClient } from "./hindsight";
@@ -30,9 +32,9 @@ export interface HostMemory {
  *  section for the bank that directory maps to, with `optInOnly` enforced. */
 export function resolveHostConfig(
   harness: string,
-  directory: string
+  directory: string,
+  cfg0 = loadConfig({ harness })
 ): { cfg: Config; bankId: string } {
-  const cfg0 = loadConfig({ harness });
   // A globally disabled plugin stops HERE, before bank derivation: `disabled` exists to be a
   // zero-overhead baseline — the same agent with no memory — not merely a silent one. Callers
   // return early on `cfg.disabled`, so the empty bank id never reaches a request.
@@ -53,32 +55,99 @@ export function resolveHostConfig(
  * sent until a caller asks for something.
  */
 export function resolveHostMemory(harness: string, directory: string): HostMemory {
-  const { cfg, bankId } = resolveHostConfig(harness, directory);
+  const memory = resolveHostConfig(harness, directory);
+  return { ...memory, client: clientFor(memory, () => resolveHostConfig(harness, directory)) };
+}
+
+function clientFor(
+  { cfg, bankId }: Pick<HostMemory, "cfg" | "bankId">,
+  reload: () => Pick<HostMemory, "cfg" | "bankId">
+): HindsightClient {
+  return new HindsightClient({
+    apiUrl: cfg.apiUrl,
+    apiToken: cfg.apiToken,
+    bank: bankId,
+    maxParallelRetains: cfg.maxParallelRetains,
+    observationScopes: cfg.observationScopes,
+    tokenProvider: () => {
+      const next = reload();
+      if (
+        cfg.principal &&
+        (next.cfg.disabled ||
+          next.cfg.principal !== cfg.principal ||
+          next.bankId !== bankId ||
+          next.cfg.apiUrl !== cfg.apiUrl)
+      )
+        throw new Error("Memory binding changed; restart this host");
+      return next.cfg.apiToken;
+    },
+  });
+}
+
+export interface MemorySharing {
+  readonly recipients: readonly string[];
+  send(input: {
+    recipient: string;
+    content: string;
+    context?: string;
+  }): Promise<{ recipient: string; documentId: string; operationId: string }>;
+}
+
+/** A directed write capability, never a change to the source host's bound client. */
+export function createSharing(
+  harness: string,
+  directory: string,
+  source: Pick<HostMemory, "cfg" | "bankId">
+): MemorySharing | undefined {
+  const principal = source.cfg.principal;
+  const registry = source.cfg.principals;
+  if (source.cfg.disabled || !principal || !registry.ok) return undefined;
+  const recipients = registry.entries[principal]?.shareTo;
+  if (!recipients?.length) return undefined;
   return {
-    cfg,
-    bankId,
-    client: new HindsightClient({
-      apiUrl: cfg.apiUrl,
-      apiToken: cfg.apiToken,
-      bank: bankId,
-      maxParallelRetains: cfg.maxParallelRetains,
-      observationScopes: cfg.observationScopes,
-      // The credential a host STARTED with is not the one it must keep using: enable auth or
-      // rotate the key mid-session and the snapshot 401s every call until restart (#3600). Read
-      // through the same pipeline the constructor used, so a per-bank `banks.<id>.apiToken` is
-      // honoured on re-resolution exactly as it was on the first one.
-      tokenProvider: () => {
-        const next = resolveHostConfig(harness, directory);
-        if (
-          cfg.principal &&
-          (next.cfg.disabled ||
-            next.cfg.principal !== cfg.principal ||
-            next.bankId !== bankId ||
-            next.cfg.apiUrl !== cfg.apiUrl)
-        )
-          throw new Error("Memory binding changed; restart this host");
-        return next.cfg.apiToken;
-      },
-    }),
+    recipients,
+    async send({ recipient, content, context }) {
+      const base = loadConfig({ harness });
+      const current = resolveHostConfig(harness, directory, base);
+      if (
+        current.cfg.disabled ||
+        current.cfg.principal !== principal ||
+        current.bankId !== source.bankId ||
+        current.cfg.apiUrl !== source.cfg.apiUrl
+      )
+        throw new Error("Memory binding changed; restart this host");
+      if (
+        !base.principals.ok ||
+        !recipients.includes(recipient) ||
+        !base.principals.entries[principal]?.shareTo.includes(recipient) ||
+        base.principals.entries[recipient]?.bankId !== registry.entries[recipient]?.bankId
+      )
+        throw new Error("Recipient is not permitted by this sharing binding");
+      const target = resolveHostConfig(harness, directory, { ...base, principal: recipient });
+      if (target.cfg.disabled || target.cfg.apiUrl !== source.cfg.apiUrl)
+        throw new Error("Recipient memory is disabled or uses a different server");
+      const client = clientFor(target, () =>
+        resolveHostConfig(harness, directory, { ...loadConfig({ harness }), principal: recipient })
+      );
+      const stamp = buildRetainStamp(target.cfg, { harness, directory, bankId: target.bankId });
+      const documentId = "shared-" + randomUUID();
+      const operationId = await client.retain(
+        principal + " shared this statement with " + recipient + ":\n\n" + content,
+        ["Statement shared by " + principal + " with " + recipient, context]
+          .filter(Boolean)
+          .join("\n"),
+        documentId,
+        [
+          ...stamp.tags,
+          "source:upload",
+          "harness:" + harness,
+          "shared-by:" + principal,
+          "shared-with:" + recipient,
+        ],
+        "document",
+        { metadata: { ...stamp.metadata, harness, shared_by: principal, shared_with: recipient } }
+      );
+      return { recipient, documentId, operationId };
+    },
   };
 }

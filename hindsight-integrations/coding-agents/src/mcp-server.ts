@@ -14,7 +14,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { type Config } from "./core/config";
-import { resolveHostMemory } from "./core/host-client";
+import { createSharing, resolveHostMemory } from "./core/host-client";
 import { HindsightClient } from "./core/hindsight";
 import { buildKnowledgeTools, type ToolSpec } from "./core/knowledge-tools";
 import { buildPageTrigger } from "./core/missions";
@@ -40,6 +40,7 @@ export function selectTools(
         repoDir: cwd,
         harness,
         principal: cfg.principal,
+        share: createSharing(harness, cwd, { cfg, bankId }),
         pageTrigger: buildPageTrigger(cfg),
         reflectTimeoutMs: cfg.reflectToolTimeoutMs,
         reflectBudget: cfg.reflectBudget,

@@ -159,4 +159,21 @@ describe("buildRetainStamp — principal provenance", () => {
     // Unbound, the claim is dropped rather than left standing: nothing wrote this as an owner.
     expect(buildRetainStamp(forged, ctx())).toEqual({ tags: ["env:work"], metadata: {} });
   });
+
+  it("cannot have a directed-sharing claim forged onto it either", () => {
+    // `shared-by:`/`shared-with:` and their metadata keys are written ONLY by the sharing
+    // capability, which resolves both owners from the registry. Configured, they would dress an
+    // ordinary retain up as a share no owner authorised — and recall answers "who told me this"
+    // from exactly those fields.
+    const { tags, metadata } = buildRetainStamp(
+      {
+        principal: "beta",
+        retainTags: ["shared-by:alpha", "shared-with:beta", "env:work"],
+        retainMetadata: { shared_by: "alpha", shared_with: "beta", repo: "acme" },
+      },
+      ctx()
+    );
+    expect(tags).toEqual(["env:work", "principal:beta"]);
+    expect(metadata).toEqual({ repo: "acme", principal: "beta" });
+  });
 });

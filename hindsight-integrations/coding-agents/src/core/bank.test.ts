@@ -7,6 +7,7 @@ vi.mock("./git-layout", () => ({ probeGitLayout: vi.fn() }));
 
 import { BankResolutionError, deriveBankId, deriveBankIdOrSkip } from "./bank";
 import { probeGitLayout } from "./git-layout";
+import { resolveConfig } from "./config";
 
 const mockProbe = vi.mocked(probeGitLayout);
 const inRepo = (commonDir: string, bare = false) =>
@@ -153,15 +154,11 @@ describe("mapPathToBank ~ expansion", () => {
  * registry that cannot be trusted refuses rather than falls back. Falling back would write one
  * identity's memory into a per-repo bank it never reads from again.
  *
- * Validation lives in core/config (`resolveConfig` -> `Config.principals`), so these cases state
- * the RESOLVED registry rather than raw file JSON.
+ * Resolve the public configuration before exercising the bank decision.
  */
 describe("principal routing", () => {
   const entries = { alpha: { bankId: "Alpha::Personal Memory" }, worker: { bankId: "archive" } };
-  const owned = (principal?: string) => ({
-    principals: { ok: true as const, entries },
-    ...(principal === undefined ? {} : { principal }),
-  });
+  const owned = (principal?: string) => resolveConfig({ principals: entries, principal });
 
   beforeEach(() => {
     mockProbe.mockReturnValue({ status: "absent" });
