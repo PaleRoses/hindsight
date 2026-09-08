@@ -31,7 +31,6 @@ type KnowledgePageResponse struct {
 	Body NullableString `json:"body,omitempty"`
 	// The full markdown document: YAML frontmatter + markdown body.
 	Markdown string `json:"markdown"`
-	IsStale NullableBool `json:"is_stale,omitempty"`
 }
 
 type _KnowledgePageResponse KnowledgePageResponse
@@ -311,48 +310,6 @@ func (o *KnowledgePageResponse) SetMarkdown(v string) {
 	o.Markdown = v
 }
 
-// GetIsStale returns the IsStale field value if set, zero value otherwise (both if not set or set to explicit null).
-func (o *KnowledgePageResponse) GetIsStale() bool {
-	if o == nil || IsNil(o.IsStale.Get()) {
-		var ret bool
-		return ret
-	}
-	return *o.IsStale.Get()
-}
-
-// GetIsStaleOk returns a tuple with the IsStale field value if set, nil otherwise
-// and a boolean to check if the value has been set.
-// NOTE: If the value is an explicit nil, `nil, true` will be returned
-func (o *KnowledgePageResponse) GetIsStaleOk() (*bool, bool) {
-	if o == nil {
-		return nil, false
-	}
-	return o.IsStale.Get(), o.IsStale.IsSet()
-}
-
-// HasIsStale returns a boolean if a field has been set.
-func (o *KnowledgePageResponse) HasIsStale() bool {
-	if o != nil && o.IsStale.IsSet() {
-		return true
-	}
-
-	return false
-}
-
-// SetIsStale gets a reference to the given NullableBool and assigns it to the IsStale field.
-func (o *KnowledgePageResponse) SetIsStale(v bool) {
-	o.IsStale.Set(&v)
-}
-// SetIsStaleNil sets the value for IsStale to be an explicit nil
-func (o *KnowledgePageResponse) SetIsStaleNil() {
-	o.IsStale.Set(nil)
-}
-
-// UnsetIsStale ensures that no value is present for IsStale, not even an explicit nil
-func (o *KnowledgePageResponse) UnsetIsStale() {
-	o.IsStale.Unset()
-}
-
 func (o KnowledgePageResponse) MarshalJSON() ([]byte, error) {
 	toSerialize,err := o.ToMap()
 	if err != nil {
@@ -379,9 +336,6 @@ func (o KnowledgePageResponse) ToMap() (map[string]interface{}, error) {
 		toSerialize["body"] = o.Body.Get()
 	}
 	toSerialize["markdown"] = o.Markdown
-	if o.IsStale.IsSet() {
-		toSerialize["is_stale"] = o.IsStale.Get()
-	}
 	return toSerialize, nil
 }
 

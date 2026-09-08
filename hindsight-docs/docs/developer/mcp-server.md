@@ -678,7 +678,7 @@ Find knowledge pages by relevance (hybrid BM25 + vector search over page names a
 
 ### get_knowledge_page
 
-Read a knowledge page as a markdown document (YAML frontmatter + synthesized body). The result also reports `is_stale`, the same verdict the tree gives for that page: `true` means memories in the page's scope have been written since it last refreshed, so verify specific claims against the source.
+Read a knowledge page as a markdown document (YAML frontmatter + synthesized body).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

@@ -2456,8 +2456,6 @@ async def _do_get_knowledge_page(
         "tags": page.display_tags,
         "timestamp": node.get("last_refreshed_at") or node.get("created_at"),
         "markdown": page_markdown.render_document(node),
-        # Travels with the document, not only with the tree: its reader is who can act on it.
-        "is_stale": node.get("is_stale"),
     }
 
 

@@ -7461,7 +7461,6 @@ components:
         markdown: markdown
         description: description
         id: id
-        is_stale: true
         type: type
         body: body
         tags:
@@ -7497,9 +7496,6 @@ components:
           description: "The full markdown document: YAML frontmatter + markdown body."
           title: Markdown
           type: string
-        is_stale:
-          nullable: true
-          type: boolean
       required:
       - id
       - markdown

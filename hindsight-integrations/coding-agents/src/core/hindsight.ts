@@ -442,20 +442,15 @@ export class HindsightClient {
     await this.req("DELETE", this.bankUrl(`/documents/${encodeURIComponent(documentId)}`));
   }
 
-  /** Count of operations still ACTIVE on this bank. Powers syncStatus's "extractions drained"
-   *  check. `active_only=true` narrows the endpoint's own `total`, so one `limit=1` probe is exact
-   *  at any backlog depth — where filtering a page saturates at its 20 rows, and a count per
-   *  non-terminal status is taken at two instants, so an op moving `pending` → `processing`
-   *  between them is missed by both and the pair reads zero on a working bank. A server too old
-   *  for the flag returns the whole table's total: an OVERCOUNT, which can never fake a drain. */
+  /** Count all pending/processing operations from the server's filtered total, not one page.
+   *  An unavailable count rejects rather than inventing a confirmed zero. */
   async activeOperations(): Promise<number> {
-    try {
-      const r = await this.req("GET", this.bankUrl("/operations?active_only=true&limit=1"));
-      const j = (await r.json()) as { total?: number };
-      return typeof j.total === "number" ? j.total : 0;
-    } catch {
-      return 0;
-    }
+    const r = await this.req("GET", this.bankUrl("/operations?active_only=true&limit=1"));
+    if (!r.ok) throw new Error(`Operation count unavailable: HTTP ${r.status}`);
+    const { total } = (await r.json()) as { total?: unknown };
+    if (typeof total !== "number" || !Number.isSafeInteger(total) || total < 0)
+      throw new Error("Invalid operation count");
+    return total;
   }
 
   /**

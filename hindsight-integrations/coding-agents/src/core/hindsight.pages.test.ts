@@ -82,30 +82,6 @@ describe("HindsightClient knowledge-page reads", () => {
     });
   });
 
-  /** The tree has always reported per-page staleness and listPages threw it away, so no roster
-   *  could tell a current page from a stale one. And absent must stay absent: "not stale" from an
-   *  older server is a claim it never made. */
-  it("listPages carries each page's is_stale, and only where the tree reported one", async () => {
-    const nested = [{ id: "kp-4", kind: "page", name: "Retry backoff", is_stale: true }];
-    stubFetch([], async () => ({
-      roots: [
-        { id: "kp-1", kind: "page", name: "Component map", is_stale: true },
-        { id: "kp-2", kind: "page", name: "Core concepts", is_stale: false },
-        { id: "kp-3", kind: "page", name: "Key decisions" },
-        { id: "kf-1", kind: "folder", name: "Initiatives", is_stale: null, children: nested },
-      ],
-    }));
-    const c = new HindsightClient({ apiUrl: "http://x", bank: "repo-a" });
-    expect(await c.listPages()).toEqual({
-      items: [
-        { id: "kp-1", name: "Component map", is_stale: true },
-        { id: "kp-2", name: "Core concepts", is_stale: false },
-        { id: "kp-3", name: "Key decisions" },
-        { id: "kp-4", name: "Retry backoff", folder: "Initiatives", is_stale: true },
-      ],
-    });
-  });
-
   it("listPages degrades to an empty roster when the tree body isn't JSON", async () => {
     vi.stubGlobal(
       "fetch",

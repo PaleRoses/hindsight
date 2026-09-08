@@ -3074,12 +3074,6 @@ class KnowledgePageResponse(BaseModel):
     timestamp: str | None = Field(default=None, description="Last refresh time (falls back to creation).")
     body: str | None = Field(default=None, description="The page's synthesized markdown body.")
     markdown: str = Field(description="The full markdown document: YAML frontmatter + markdown body.")
-    is_stale: bool | None = Field(
-        default=None,
-        description="True when a memory in this page's scope has been written since the page last "
-        "read the memories — the same check the refresh gate asks, and the one the tree endpoint "
-        "already reports. Null when the page has no backing mental model.",
-    )
 
 
 class KnowledgePageBundleFile(BaseModel):
@@ -3157,7 +3151,6 @@ def _knowledge_page_response(node: dict[str, Any]) -> KnowledgePageResponse:
         timestamp=node.get("last_refreshed_at") or node.get("created_at"),
         body=node.get("content"),
         markdown=page_markdown.render_document(node),
-        is_stale=node.get("is_stale"),
     )
 
 
