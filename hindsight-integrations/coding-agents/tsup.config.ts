@@ -49,6 +49,9 @@ export default defineConfig({
     "devin-hook": "src/devin-hook.ts",
     "devin-sessionstart-hook": "src/devin-sessionstart-hook.ts",
     "devin-stop-hook": "src/devin-stop-hook.ts",
+    "zcode-hook": "src/zcode-hook.ts",
+    "zcode-sessionstart-hook": "src/zcode-sessionstart-hook.ts",
+    "zcode-stop-hook": "src/zcode-stop-hook.ts",
     "droid-hook": "src/droid-hook.ts",
     "droid-sessionstart-hook": "src/droid-sessionstart-hook.ts",
     "droid-stop-hook": "src/droid-stop-hook.ts",
@@ -81,5 +84,7 @@ export default defineConfig({
     /^zod/,
     /^@vectorize-io\/hindsight-all/,
     /^jsonc-parser/,
+    // smol-toml likewise: installer.js parses ~/.grok/config.toml with it.
+    /^smol-toml/,
   ],
 });
